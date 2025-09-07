@@ -1,0 +1,53 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: controller-manager-cluster-service-versions
+  namespace: openshift-operators
+subjects:
+  - kind: ServiceAccount
+    name: itz-deployer-operator-controller-manager
+    namespace: openshift-operators
+roleRef:
+  kind: Role
+  name: cluster-service-versions-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: controller-manager-subscriptions
+  namespace: openshift-operators
+subjects:
+  - kind: ServiceAccount
+    name: itz-deployer-operator-controller-manager
+    namespace: openshift-operators
+roleRef:
+  kind: Role
+  name: subscriptions-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: itz-deployer-operator-controller-manager
+    namespace: openshift-operators
+roleRef:
+  kind: ClusterRole
+  name: argocd-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-tasks-reader-binding
+subjects:
+  - kind: ServiceAccount
+    name: itz-deployer-operator-controller-manager
+    namespace: openshift-operators
+roleRef:
+  kind: ClusterRole
+  name: tekton-tasks-reader
+  apiGroup: rbac.authorization.k8s.io

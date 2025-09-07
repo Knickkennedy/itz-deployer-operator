@@ -1,0 +1,7 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: leader-election-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: itz-deployer-operator-controller-manager

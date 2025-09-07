@@ -1,0 +1,9 @@
+apiVersion: techzone.techzone.ibm.com/v1alpha1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: itz-deployer-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: deployment-sample
+spec:
+  # TODO(user): Add fields here
