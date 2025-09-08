@@ -29,9 +29,10 @@ type DeploymentSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Foo is an example field of Deployment. Edit deployment_types.go to remove/update
-	RepoName     string `json:"repoName"`
-	Release      string `json:"release"`
-	Parameters   string `json:"parameters,omitempty"`
+	RepoName   string `json:"repoName"`
+	Release    string `json:"release"`
+	Parameters string `json:"parameters,omitempty"`
+	// +kubebuilder:validation:Enum=ansible;tekton;bash
 	WorkloadType string `json:"workloadType"`
 	Entrypoint   string `json:"entrypoint,omitempty"`
 }

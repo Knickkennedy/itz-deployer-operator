@@ -50,6 +50,10 @@ spec:
                   to remove/update
                 type: string
               workloadType:
+                enum:
+                - ansible
+                - tekton
+                - bash
                 type: string
             required:
             - release
