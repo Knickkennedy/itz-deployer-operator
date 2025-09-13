@@ -23,6 +23,17 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// Deployment is the Schema for the deployments API.
+type Deployment struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   DeploymentSpec   `json:"spec,omitempty"`
+	Status DeploymentStatus `json:"status,omitempty"`
+}
+
 // DeploymentSpec defines the desired state of Deployment.
 type DeploymentSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
@@ -44,18 +55,6 @@ type DeploymentStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 	Phase      string             `json:"phase,omitempty"`
 	Message    string             `json:"message,omitempty"`
-}
-
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-
-// Deployment is the Schema for the deployments API.
-type Deployment struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	Spec   DeploymentSpec   `json:"spec,omitempty"`
-	Status DeploymentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
