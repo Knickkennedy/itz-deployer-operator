@@ -131,7 +131,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Step 3: Get the GitHub PAT from Secrets Manager
 	// Replace "deployer-github-pat" with your actual secret ID from Secrets Manager
-	pat, err := getGitHubPAT(secretsManagerAPI, "949bba75-e8f5-bc89-aac0-c6ab84335f71")
+	pat, err := getGitHubPAT(secretsManagerAPI, "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get GitHub PAT: %w", err)
 	}
@@ -245,6 +245,8 @@ func getGitHubPAT(secretsManagerAPI *sm.SecretsManagerV2, secretID string) (stri
 	// Extract the payload (which is your GitHub PAT)
 	// The Payload is already a *string, so we can directly dereference it.
 	pat := *arbitrarySecret.Payload
+
+	pat = strings.TrimSpace(pat)
 
 	return pat, nil
 }
