@@ -18,7 +18,7 @@ metadata:
         }
       ]
     capabilities: Basic Install
-    createdAt: "2025-09-13T22:15:01Z"
+    createdAt: "2025-09-16T22:33:33Z"
     operators.operatorframework.io/builder: operator-sdk-v1.41.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
   name: itz-deployer-operator.v0.0.7
@@ -151,7 +151,7 @@ spec:
                 - --health-probe-bind-address=:8081
                 command:
                 - /manager
-                image: docker.io/knickkennedy/itz-deployer-operator:v0.0.7
+                image: quay.io/ibmtz/deployer-operator:v0.0.7
                 imagePullPolicy: Always
                 livenessProbe:
                   httpGet:

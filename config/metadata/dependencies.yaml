@@ -1,0 +1,13 @@
+dependencies:
+  - type: olm.package
+    value:
+      packageName: openshift-pipelines-operator-rh
+      version: ">1.11.0 <1.14.0"
+  - type: olm.package
+    value:
+      packageName: external-secrets-operator
+      version: ">=0.9.5"
+  - type: olm.package
+    value:
+      packageName: openshift-gitops-operator
+      version: ">=1.8.0"
