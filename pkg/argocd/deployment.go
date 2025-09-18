@@ -96,7 +96,7 @@ func createDeployment(kclient client.Client) error {
 			APIVersion: "argoproj.io/v1beta1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "openshift-gitops-otp",
+			Name:      "openshift-gitops",
 			Namespace: "openshift-gitops",
 		},
 		Spec: ArgoCDSpec{

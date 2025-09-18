@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  creationTimestamp: null
+  name: openshift-oauth-default-sa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-argocd-cluster-argocd-application-controller
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: sso-integration
