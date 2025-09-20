@@ -39,8 +39,13 @@ spec:
           spec:
             description: DeploymentSpec defines the desired state of Deployment.
             properties:
-              entrypoint:
-                type: string
+              ansible:
+                properties:
+                  ansiblePlaybook:
+                    type: string
+                  requirements:
+                    type: string
+                type: object
               parameters:
                 type: string
               release:
@@ -49,16 +54,9 @@ spec:
                 description: Foo is an example field of Deployment. Edit deployment_types.go
                   to remove/update
                 type: string
-              workloadType:
-                enum:
-                - ansible
-                - tekton
-                - bash
-                type: string
             required:
             - release
             - repoName
-            - workloadType
             type: object
           status:
             description: DeploymentStatus defines the observed state of Deployment.

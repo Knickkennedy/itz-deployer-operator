@@ -40,21 +40,34 @@ type DeploymentSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Foo is an example field of Deployment. Edit deployment_types.go to remove/update
-	RepoName   string `json:"repoName"`
-	Release    string `json:"release"`
-	Parameters string `json:"parameters,omitempty"`
-	// +kubebuilder:validation:Enum=ansible;tekton;bash
-	WorkloadType string `json:"workloadType"`
-	Entrypoint   string `json:"entrypoint,omitempty"`
+	RepoName       string         `json:"repoName"`
+	Release        string         `json:"release"`
+	Parameters     string         `json:"parameters,omitempty"`
+	Ansible        Ansible        `json:"ansible,omitempty"`
+	PostDeployment PostDeployment `json:"postDeployment,omitempty"`
 }
 
 // DeploymentStatus defines the observed state of Deployment.
 type DeploymentStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
-	Phase      string             `json:"phase,omitempty"`
-	Message    string             `json:"message,omitempty"`
+	Conditions            []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+	Phase                 string             `json:"phase,omitempty"`
+	Message               string             `json:"message,omitempty"`
+	PostDeploymentPhase   string             `json:"postDeploymentPhase,omitempty"`
+	PostDeploymentMessage string             `json:"postDeploymentMessage,omitempty"`
+}
+
+type Ansible struct {
+	AnsiblePlaybook string `json:"ansiblePlaybook,omitempty"`
+	Requirements    string `json:"requirements,omitempty"`
+}
+
+type PostDeployment struct {
+	RepoName   string  `json:"repoName"`
+	Release    string  `json:"release"`
+	Parameters string  `json:"parameters,omitempty"`
+	Ansible    Ansible `json:"ansible,omitempty"`
 }
 
 // +kubebuilder:object:root=true

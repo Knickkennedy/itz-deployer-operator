@@ -70,7 +70,7 @@ const (
 	gitBaseOrgURL = "https://github.ibm.com/itz-content"
 
 	// Template repository names
-	ansibleTemplateRepoName = "tekton-pipeline-ansible-example"
+	ansibleTemplateRepoName = "deployer-ansible-runner"
 
 	pipelineFileName    = "pipeline.yaml"
 	pipelineRunFileName = "pipelinerun.yaml"
@@ -96,25 +96,13 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Determine which Git repository to clone based on the workload type
 	var gitRepoURL string
-	switch deployment.Spec.WorkloadType {
-	case "ansible":
+	switch {
+	case deployment.Spec.Ansible.AnsiblePlaybook != "":
 		// This case is for the special Ansible template
 		gitRepoURL = fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), ansibleTemplateRepoName)
-	case "tekton":
+	default:
 		// The default case handles all other scenarios, which we've defined as standard Tekton pipelines.
 		gitRepoURL = fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), deployment.Spec.RepoName)
-	default:
-		// Handle invalid workload type by logging an error and updating status
-		errMsg := fmt.Sprintf("Invalid workloadType: %s. Must be 'ansible' or 'tekton'.", deployment.Spec.WorkloadType)
-		logger.Error(nil, errMsg)
-
-		deployment.Status.Phase = "Failed"
-		deployment.Status.Message = errMsg
-		if err := kclient.Status().Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to update Deployment status")
-		}
-		// Returning without an error or a requeue stops the reconciliation.
-		return ctrl.Result{}, nil
 	}
 
 	// Step 1: Get the IBM API Key from the Kubernetes Secret
@@ -318,8 +306,8 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 	pipelineRun.SetNamespace(deployment.Namespace)
 
 	// Step 4: Conditionally inject parameters based on WorkloadType.
-	switch deployment.Spec.WorkloadType {
-	case "ansible":
+	switch {
+	case deployment.Spec.Ansible.AnsiblePlaybook != "":
 		// For Ansible, we construct the parameters from the DeploymentSpec directly.
 		pipelineRun.Spec.Params = []tektonv1.Param{
 			{
@@ -333,7 +321,7 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 				Name: "entrypoint",
 				Value: tektonv1.ParamValue{
 					Type:      tektonv1.ParamTypeString,
-					StringVal: deployment.Spec.Entrypoint, // Assumes Entrypoint is a new field on your spec
+					StringVal: deployment.Spec.Ansible.AnsiblePlaybook, // Assumes Entrypoint is a new field on your spec
 				},
 			},
 			{
@@ -344,7 +332,7 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 				},
 			},
 		}
-	case "tekton":
+	default:
 		// For Tekton, we use the old logic of merging an external parameters file.
 		if deployment.Spec.Parameters != "" {
 			paramsPath := filepath.Join(repoDir, deployment.Spec.Parameters)
