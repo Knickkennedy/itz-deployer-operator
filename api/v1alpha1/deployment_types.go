@@ -51,11 +51,10 @@ type DeploymentSpec struct {
 type DeploymentStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Conditions            []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
-	Phase                 string             `json:"phase,omitempty"`
-	Message               string             `json:"message,omitempty"`
-	PostDeploymentPhase   string             `json:"postDeploymentPhase,omitempty"`
-	PostDeploymentMessage string             `json:"postDeploymentMessage,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+	Phase           string             `json:"phase,omitempty"`
+	Message         string             `json:"message,omitempty"`
+	PipelineRunName string             `json:"pipelineRunName,omitempty"`
 }
 
 type Ansible struct {

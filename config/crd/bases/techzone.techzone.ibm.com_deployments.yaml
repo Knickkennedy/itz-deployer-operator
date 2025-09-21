@@ -48,6 +48,25 @@ spec:
                 type: object
               parameters:
                 type: string
+              postDeployment:
+                properties:
+                  ansible:
+                    properties:
+                      ansiblePlaybook:
+                        type: string
+                      requirements:
+                        type: string
+                    type: object
+                  parameters:
+                    type: string
+                  release:
+                    type: string
+                  repoName:
+                    type: string
+                required:
+                - release
+                - repoName
+                type: object
               release:
                 type: string
               repoName:
@@ -123,6 +142,8 @@ spec:
               message:
                 type: string
               phase:
+                type: string
+              pipelineRunName:
                 type: string
             type: object
         type: object
