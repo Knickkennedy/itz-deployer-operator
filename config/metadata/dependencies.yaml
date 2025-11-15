@@ -7,3 +7,7 @@ dependencies:
     value:
       packageName: openshift-gitops-operator
       version: ">=1.15.0"
+  - type: olm.package
+    value:
+      packageName: external-secrets-operator
+      version: ">=0.9.5"
