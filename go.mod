@@ -13,8 +13,8 @@ require (
 	github.com/openshift/api v0.0.0-20231017161003-8f2e18642ccb
 	github.com/operator-framework/api v0.18.0
 	github.com/tektoncd/pipeline v0.58.0
-	k8s.io/api v0.34.0
-	k8s.io/apimachinery v0.34.0
+	k8s.io/api v0.34.2
+	k8s.io/apimachinery v0.34.2
 	k8s.io/client-go v0.34.0
 	knative.dev/pkg v0.0.0-20231023150739-56bfe0dd9626
 	sigs.k8s.io/controller-runtime v0.21.0

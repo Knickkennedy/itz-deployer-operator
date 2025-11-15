@@ -7,10 +7,8 @@ import (
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	deployerv1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -18,12 +16,10 @@ import (
 func CreateClient() (client.Client, error) {
 	scheme := runtime.NewScheme()
 	v1alpha1.AddToScheme(scheme)
-	appsv1.AddToScheme(scheme)           // Deployment
-	corev1.AddToScheme(scheme)           // Service
+	clientgoscheme.AddToScheme(scheme)
 	consolev1alpha1.AddToScheme(scheme)  // ConsolePlugin
 	configv1.AddToScheme(scheme)         // ClusterVersion
 	deployerv1alpha1.AddToScheme(scheme) // deployer
-	rbacv1.AddToScheme(scheme)           // rbac
 	v1beta1.AddToScheme(scheme)          // external secrets
 	pipelinev1.AddToScheme(scheme)       // pipeline
 

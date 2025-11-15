@@ -18,7 +18,7 @@ metadata:
         }
       ]
     capabilities: Basic Install
-    createdAt: "2025-11-13T20:41:10Z"
+    createdAt: "2025-11-15T21:08:22Z"
     operators.operatorframework.io/builder: operator-sdk-v1.41.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
   name: itz-deployer-operator.v0.0.7

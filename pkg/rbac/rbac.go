@@ -23,11 +23,11 @@ import (
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;create;update
 
 const (
-	serviceAccount = "pipeline"
-	namespace      = "default"
-	gitUsername    = "x-oauth-basic"
-	secretName     = "github-ibm-pat"
-	secretID       = "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7"
+	ServiceAccount = "pipeline"
+	Namespace      = "default"
+	GitUserName    = "x-oauth-basic"
+	SecretName     = "github-ibm-pat"
+	SecretID       = "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7"
 )
 
 func Run() error {
@@ -43,11 +43,11 @@ func Run() error {
 	err = createPipelineSecretAndMount(
 		context.TODO(),
 		client,
-		namespace,
-		serviceAccount,
-		secretID,
-		secretName,
-		gitUsername,
+		Namespace,
+		ServiceAccount,
+		SecretID,
+		SecretName,
+		GitUserName,
 	)
 	if err != nil {
 		ctrl.Log.Error(err, "Failed to create required github secret")
@@ -68,8 +68,8 @@ func createPipelineRBAC(kclient client.Client) error {
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      serviceAccount,
-				Namespace: namespace,
+				Name:      ServiceAccount,
+				Namespace: Namespace,
 			},
 		},
 		RoleRef: rbacv1.RoleRef{
