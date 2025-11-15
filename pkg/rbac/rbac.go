@@ -114,6 +114,9 @@ func createGitHubSecret(ctx context.Context, c client.Client, namespace, secretN
 
 	err := c.Create(ctx, secret)
 	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			return secret, nil
+		}
 		return nil, fmt.Errorf("failed to create secret %s in namespace %s: %w", secretName, namespace, err)
 	}
 
@@ -153,58 +156,64 @@ func mountSecretToServiceAccount(ctx context.Context, c client.Client, namespace
 func createPipelineSecretAndMount(ctx context.Context, c client.Client, namespace, saName, secretID, secretName, username string) error {
 	// Step 1: Retrieve the IBM API Key (your ibm package logic is unchanged)
 	apiKeyOperation := func() (string, error) {
+		ctrl.Log.Info("Attempting to retrieve IBM API Key.")
 		return ibm.GetIBMAPIKey(ctx)
 	}
 	b := backoff.NewExponentialBackOff()
 	opts := []backoff.RetryOption{
 		backoff.WithBackOff(b),
-		backoff.WithMaxElapsedTime(60 * time.Second),
+		backoff.WithMaxElapsedTime(360 * time.Second),
 	}
 	apiKey, err := backoff.Retry(ctx, apiKeyOperation, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to get IBM API key: %w", err)
 	}
+	b.Reset()
 
 	// Step 2: Create the Secrets Manager client (your ibm package logic is unchanged)
 	secretOperation := func() (*sm.SecretsManagerV2, error) {
+		ctrl.Log.Info("Attempting to retrieve IBM Secret Manager Credentials.")
 		return ibm.CreateSecretsManagerClient(apiKey)
 	}
-	b = backoff.NewExponentialBackOff()
 	smClient, err := backoff.Retry(ctx, secretOperation, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create Secrets Manager client: %w", err)
 	}
+	b.Reset()
 
 	// Step 3: Retrieve the GitHub PAT from Secrets Manager (your ibm package logic is unchanged)
 	githubOperation := func() (string, error) {
+		ctrl.Log.Info("Attempting to retrieve the Github Token.")
 		return ibm.GetGitHubPAT(smClient, secretID)
 	}
-	b = backoff.NewExponentialBackOff()
 	githubPAT, err := backoff.Retry(ctx, githubOperation, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to get GitHub PAT: %w", err)
 	}
+	b.Reset()
 
 	// Step 4: Create the Kubernetes Secret using the new client
 	k8sSecretOperation := func() (*corev1.Secret, error) {
+		ctrl.Log.Info(fmt.Sprintf("Attempting to create secret: %s.", secretName))
 		return createGitHubSecret(ctx, c, namespace, secretName, username, githubPAT)
 	}
-	b = backoff.NewExponentialBackOff()
 	_, err = backoff.Retry(ctx, k8sSecretOperation, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create GitHub secret: %w", err)
 	}
+	b.Reset()
 
 	// Step 5: Mount the secret to the ServiceAccount using the new client
 	mountOperation := func() (struct{}, error) {
+		ctrl.Log.Info(fmt.Sprintf("Attempting to mount %s to %s.", secretName, saName))
 		err := mountSecretToServiceAccount(ctx, c, namespace, saName, secretName)
 		return struct{}{}, err
 	}
-	b = backoff.NewExponentialBackOff()
 	_, err = backoff.Retry(ctx, mountOperation, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to mount secret to service account: %w", err)
 	}
+	b.Reset()
 
 	fmt.Printf("Successfully created and mounted secret %s to service account %s in namespace %s.\n", secretName, saName, namespace)
 
