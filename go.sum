@@ -342,6 +342,8 @@ github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8
 github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
 github.com/openshift/api v0.0.0-20231017161003-8f2e18642ccb h1:ez6Jrs2pSGMdPMR4l6znFIXfrNHJeXmg7baebSju7tk=
 github.com/openshift/api v0.0.0-20231017161003-8f2e18642ccb/go.mod h1:qNtV0315F+f8ld52TLtPvrfivZpdimOzTi3kn9IVbtU=
+github.com/openshift/api v0.0.0-20251114162712-6711368ea523 h1:GUSzZoRmBHQElwezc+qvHsI714N0QyBHxaeCEj0QA8g=
+github.com/openshift/api v0.0.0-20251114162712-6711368ea523/go.mod h1:d5uzF0YN2nQQFA0jIEWzzOZ+edmo6wzlGLvx5Fhz4uY=
 github.com/operator-framework/api v0.18.0 h1:6EdSNeAjin4LRu2YQnQWMJMc6HXS0AQDG+CfaEvFrAo=
 github.com/operator-framework/api v0.18.0/go.mod h1:SCCslqke6AVOJ5JM+NqNE1CHuAgJLScsL66pnPaSMXs=
 github.com/pjbgf/sha1cd v0.4.0 h1:NXzbL1RvjTUi6kgYZCX3fPwwl27Q1LJndxtUDVfJGRY=

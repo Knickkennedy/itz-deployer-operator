@@ -21,12 +21,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"knative.dev/pkg/apis"
 
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/rest"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -45,6 +47,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	console "github.com/openshift/api/console/v1"
+	routev1 "github.com/openshift/api/route/v1"
 	techzonev1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
 	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
 	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
@@ -55,6 +59,7 @@ import (
 type DeploymentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	Config *rest.Config
 }
 
 // +kubebuilder:rbac:groups=techzone.techzone.ibm.com,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -88,6 +93,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
+	r.ReconcileConsoleNotification(ctx, deployment)
 	// Step 1: Handle the main deployment phase.
 	if deployment.Status.Phase != "Succeeded" && deployment.Status.Phase != "Failed" {
 		result, err := r.reconcileDeploymentPhase(ctx, kclient, deployment, deployment.Spec)
@@ -278,7 +284,7 @@ func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deploy
 			logger.Error(err, "Failed to update Deployment status with run name.")
 		}
 
-		return nil, nil
+		return job, nil
 	} else if err != nil {
 		return nil, err
 	}
@@ -540,52 +546,61 @@ func (r *DeploymentReconciler) updateStatus(ctx context.Context, deployment *tec
 	var succeededCondition *apis.Condition
 	var isComplete bool // Flag to check if the status update is complete
 
+	if statusObject == nil {
+		logger.Info("Status object is currently nil")
+		return nil
+	}
+
 	// 1. Use a type switch to handle different status objects
 	switch obj := statusObject.(type) {
 	case *tektonv1.PipelineRun:
 		// Tekton PipelineRun status logic
-		if obj.Status.Conditions != nil {
-			succeededCondition = obj.Status.GetCondition(apis.ConditionSucceeded)
-			isComplete = true // We have successfully found the Tekton condition
+		if obj != nil {
+			if obj.Status.Conditions != nil {
+				succeededCondition = obj.Status.GetCondition(apis.ConditionSucceeded)
+				isComplete = true // We have successfully found the Tekton condition
+			}
 		}
 	case *batchv1.Job:
 		// Kubernetes Job status logic
-		if obj.Status.Conditions != nil {
-			for _, cond := range obj.Status.Conditions {
-				// A Job is complete if it has a "Complete" condition set to true
-				// or a "Failed" condition set to true. For simplicity, we check
-				// the completion conditions and map them to our Succeeded/Failed/Running phases.
-				if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
-					// Map Job success to a Tekton-like succeeded condition
-					succeededCondition = &apis.Condition{
-						Type:    apis.ConditionSucceeded,
-						Status:  corev1.ConditionTrue,
-						Message: "Kubernetes Job completed successfully.",
+		if obj != nil {
+			if obj.Status.Conditions != nil {
+				for _, cond := range obj.Status.Conditions {
+					// A Job is complete if it has a "Complete" condition set to true
+					// or a "Failed" condition set to true. For simplicity, we check
+					// the completion conditions and map them to our Succeeded/Failed/Running phases.
+					if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+						// Map Job success to a Tekton-like succeeded condition
+						succeededCondition = &apis.Condition{
+							Type:    apis.ConditionSucceeded,
+							Status:  corev1.ConditionTrue,
+							Message: "Kubernetes Job completed successfully.",
+						}
+						isComplete = true
+						break
+					} else if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+						// Map Job failure to a Tekton-like succeeded condition (but False)
+						succeededCondition = &apis.Condition{
+							Type:    apis.ConditionSucceeded,
+							Status:  corev1.ConditionFalse,
+							Message: cond.Message, // Use the Job's failure message
+						}
+						isComplete = true
+						break
 					}
-					isComplete = true
-					break
-				} else if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
-					// Map Job failure to a Tekton-like succeeded condition (but False)
-					succeededCondition = &apis.Condition{
-						Type:    apis.ConditionSucceeded,
-						Status:  corev1.ConditionFalse,
-						Message: cond.Message, // Use the Job's failure message
-					}
-					isComplete = true
-					break
 				}
 			}
-		}
 
-		// If the Job isn't explicitly Complete or Failed, it's considered Running.
-		if !isComplete && obj.Status.Active > 0 {
-			// Set a "Running" status similar to Tekton's ConditionUnknown
-			succeededCondition = &apis.Condition{
-				Type:    apis.ConditionSucceeded,
-				Status:  corev1.ConditionUnknown,
-				Message: "Kubernetes Job is in progress.",
+			// If the Job isn't explicitly Complete or Failed, it's considered Running.
+			if !isComplete && obj.Status.Active > 0 {
+				// Set a "Running" status similar to Tekton's ConditionUnknown
+				succeededCondition = &apis.Condition{
+					Type:    apis.ConditionSucceeded,
+					Status:  corev1.ConditionUnknown,
+					Message: "Kubernetes Job is in progress.",
+				}
+				isComplete = true
 			}
-			isComplete = true
 		}
 	default:
 		// Handle unsupported type
@@ -628,4 +643,171 @@ func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("deployment").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 5}).
 		Complete(r)
+}
+
+func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
+	// 1. Define the desired notification object based on the current phase
+	var desiredNotification *console.ConsoleNotification
+	logger := logf.FromContext(ctx)
+	kclient, err := utils.CreateClient()
+
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Checking console notification banner.")
+	// Use a unique, predictable name for the notification
+	name := fmt.Sprintf("%s-status-banner", deployment.Name)
+	externalURL, err := r.GetExternalClusterBaseURL(ctx)
+
+	if err != nil {
+		return err
+	}
+
+	switch deployment.Status.Phase {
+	case "Failed":
+		// Create a persistent, non-dismissible red alert banner
+		desiredNotification = &console.ConsoleNotification{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: console.GroupVersion.String(),
+				Kind:       "ConsoleNotification",
+			},
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: console.ConsoleNotificationSpec{
+				Text: fmt.Sprintf("CR '%s' failed: %s", deployment.Name, deployment.Status.Message),
+				Link: &console.Link{
+					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+					Text: "See more information in the pods here.",
+				},
+				Location:        console.BannerTop,
+				BackgroundColor: "#C00000", // Dark Red for critical failure
+			},
+		}
+	case "Running":
+		// Create a temporary, dismissible yellow banner for long operations
+		desiredNotification = &console.ConsoleNotification{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: console.GroupVersion.String(),
+				Kind:       "ConsoleNotification",
+			},
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: console.ConsoleNotificationSpec{
+				Text: fmt.Sprintf("CR '%s' is running (Phase: %s)...", deployment.Name, deployment.Status.Phase),
+				Link: &console.Link{
+					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+					Text: "See more information in the pods here.",
+				},
+				Location:        console.BannerTop,
+				BackgroundColor: "#006699",
+			},
+		}
+	case "Succeeded":
+		// Fall through to delete the notification if it exists
+		desiredNotification = &console.ConsoleNotification{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: console.GroupVersion.String(),
+				Kind:       "ConsoleNotification",
+			},
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: console.ConsoleNotificationSpec{
+				Text: fmt.Sprintf("CR '%s' is finished! (Phase: %s)...", deployment.Name, deployment.Status.Phase),
+				Link: &console.Link{
+					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+					Text: "See more information in the pods here.",
+				},
+				Location:        console.BannerTop,
+				BackgroundColor: "#4CAF50",
+			},
+		}
+	default:
+		desiredNotification = &console.ConsoleNotification{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: console.GroupVersion.String(),
+				Kind:       "ConsoleNotification",
+			},
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: console.ConsoleNotificationSpec{
+				Text: fmt.Sprintf("CR '%s' is starting...", deployment.Name),
+				Link: &console.Link{
+					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+					Text: "See more information in the pods here.",
+				},
+				Location:        console.BannerTop,
+				BackgroundColor: "#FFD700",
+			},
+		}
+	}
+
+	existingNotification := &console.ConsoleNotification{}
+	key := client.ObjectKey{Name: name}
+
+	err = kclient.Get(ctx, key, existingNotification)
+
+	if err != nil && errors.IsNotFound(err) {
+		// The desiredNotification already has the correct Spec set from the switch case
+		logger.Info("Creating ConsoleNotification banner", "Name", name)
+		if createErr := kclient.Create(ctx, desiredNotification); createErr != nil {
+			logger.Error(createErr, "Failed to create ConsoleNotification")
+			return createErr
+		}
+
+	} else if err == nil {
+		// B.2. Resource exists: UPDATE it.
+
+		if !reflect.DeepEqual(existingNotification.Spec, desiredNotification.Spec) {
+
+			existingNotification.Spec = desiredNotification.Spec
+
+			logger.Info("Updating ConsoleNotification banner", "Name", name)
+			if updateErr := kclient.Update(ctx, existingNotification); updateErr != nil {
+				if errors.IsConflict(updateErr) {
+					return fmt.Errorf("conflict during ConsoleNotification update, requeueing: %w", updateErr)
+				}
+				logger.Error(updateErr, "Failed to update ConsoleNotification")
+				return updateErr
+			}
+		} else {
+			logger.V(1).Info("ConsoleNotification already in desired state, skipping update.")
+		}
+
+	} else {
+		// B.3. Failed to Get for an unknown reason.
+		logger.Error(err, "Failed to get ConsoleNotification during update check")
+		return err
+	}
+
+	return nil
+}
+
+// GetExternalClusterBaseURL fetches the public host address of the OpenShift Console.
+func (r *DeploymentReconciler) GetExternalClusterBaseURL(ctx context.Context) (string, error) {
+	kclient, err := utils.CreateClient()
+
+	if err != nil {
+		return "", err
+	}
+
+	// 1. Define the target Route key (namespace and name)
+	routeKey := types.NamespacedName{
+		Namespace: "openshift-console",
+		Name:      "console",
+	}
+
+	consoleRoute := &routev1.Route{}
+
+	// 2. Fetch the Route object
+	err = kclient.Get(ctx, routeKey, consoleRoute)
+	if err != nil {
+		// If the Route isn't found, log a warning (it may not exist in non-OCP clusters)
+		return "", fmt.Errorf("failed to get OpenShift console Route: %w", err)
+	}
+
+	// 3. Extract the public host
+	host := consoleRoute.Spec.Host
+	if host == "" {
+		return "", fmt.Errorf("console route spec.host is empty")
+	}
+
+	// Routes are always HTTPS by default in OpenShift, but prepend 'https://' for certainty.
+	return fmt.Sprintf("https://%s", host), nil
 }

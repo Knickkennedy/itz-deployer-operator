@@ -3,7 +3,8 @@ package utils
 import (
 	v1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	configv1 "github.com/openshift/api/config/v1"
-	consolev1alpha1 "github.com/openshift/api/console/v1alpha1"
+	consolev1 "github.com/openshift/api/console/v1"
+	routev1 "github.com/openshift/api/route/v1"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	deployerv1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
@@ -17,7 +18,8 @@ func CreateClient() (client.Client, error) {
 	scheme := runtime.NewScheme()
 	v1alpha1.AddToScheme(scheme)
 	clientgoscheme.AddToScheme(scheme)
-	consolev1alpha1.AddToScheme(scheme)  // ConsolePlugin
+	consolev1.AddToScheme(scheme) // ConsolePlugin
+	routev1.AddToScheme(scheme)
 	configv1.AddToScheme(scheme)         // ClusterVersion
 	deployerv1alpha1.AddToScheme(scheme) // deployer
 	v1beta1.AddToScheme(scheme)          // external secrets
