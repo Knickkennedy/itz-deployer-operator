@@ -5,16 +5,17 @@ go 1.24.4
 require (
 	github.com/IBM/go-sdk-core/v5 v5.21.0
 	github.com/IBM/secrets-manager-go-sdk/v2 v2.0.15
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/external-secrets/external-secrets v0.19.1
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/go-logr/logr v1.4.3
 	github.com/onsi/ginkgo/v2 v2.23.4
 	github.com/onsi/gomega v1.37.0
-	github.com/openshift/api v0.0.0-20231017161003-8f2e18642ccb
+	github.com/openshift/api v0.0.0-20251114162712-6711368ea523
 	github.com/operator-framework/api v0.18.0
 	github.com/tektoncd/pipeline v0.58.0
-	k8s.io/api v0.34.0
-	k8s.io/apimachinery v0.34.0
+	k8s.io/api v0.34.2
+	k8s.io/apimachinery v0.34.2
 	k8s.io/client-go v0.34.0
 	knative.dev/pkg v0.0.0-20231023150739-56bfe0dd9626
 	sigs.k8s.io/controller-runtime v0.21.0
@@ -34,7 +35,6 @@ require (
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/blendle/zapdriver v1.3.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.1 // indirect

@@ -2,8 +2,8 @@ package argocd
 
 import (
 	"github.com/go-logr/logr"
-	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
 	ctrl "sigs.k8s.io/controller-runtime"
+	client "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var argoCDLog logr.Logger
@@ -13,7 +13,7 @@ func initLogger() {
 	println(">>>> ArgoCD Run() called") // raw stdout
 }
 
-func Run() {
+func Run(c client.Client) {
 	defer func() {
 		if r := recover(); r != nil {
 			println("PANIC in Run():", r)
@@ -24,11 +24,15 @@ func Run() {
 	initLogger()
 	argoCDLog.Info("Initializing ArgoCD setup...")
 
-	client, _ := utils.CreateClient()
-	err := argoDeployment(client)
-	if err != nil {
-		argoCDLog.Error(err, err.Error())
+	if err := argoDeployment(c); err != nil {
+		argoCDLog.Error(err, "Failed to deploy ArgoCD")
+		return
 	}
-	argoApplication(client)
-	argoCDLog.Info("ArgoCD instance created successfully!")
+
+	if err := argoApplication(c); err != nil {
+		argoCDLog.Error(err, "Failed to install ArgoCD application")
+		return
+	}
+
+	argoCDLog.Info("ArgoCD setup completed successfully!")
 }
