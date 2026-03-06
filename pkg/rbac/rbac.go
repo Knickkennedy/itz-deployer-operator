@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	utlis "github.ibm.com/itz-content/itz-deployer-operator/pkg"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -15,84 +14,80 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
 
-	sm "github.com/IBM/secrets-manager-go-sdk/v2/secretsmanagerv2"
 	backoff "github.com/cenkalti/backoff/v5"
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
 	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
 )
 
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;create;update
 
-const (
-	ServiceAccount = "pipeline"
-	Namespace      = "default"
-	GitUserName    = "x-oauth-basic"
-	SecretName     = "github-ibm-pat"
-	SecretID       = "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7"
-)
+var rbacLog = ctrl.Log.WithName("RBAC")
 
-func CreateArgoCDRBAC() error {
+const retryMaxElapsed = 360 * time.Second
+
+// retry is a generic helper that wraps backoff.Retry with a standard exponential backoff policy.
+func retry[T any](ctx context.Context, op func() (T, error)) (T, error) {
+	b := backoff.NewExponentialBackOff()
+	opts := []backoff.RetryOption{
+		backoff.WithBackOff(b),
+		backoff.WithMaxElapsedTime(retryMaxElapsed),
+	}
+	return backoff.Retry(ctx, op, opts...)
+}
+
+// getGitHubPAT retrieves the IBM API key, creates the Secrets Manager client,
+// and fetches the GitHub PAT. This is the shared path used by both CreateArgoCDRBAC
+// and createPipelineSecretAndMount.
+func getGitHubPAT(ctx context.Context, cfg config.OperatorConfig) (string, error) {
+	apiKey, err := retry(ctx, func() (string, error) {
+		rbacLog.Info("Attempting to retrieve IBM API Key.")
+		return ibm.GetIBMAPIKey(ctx)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get IBM API key: %w", err)
+	}
+
+	smClient, err := retry(ctx, func() (ibm.SecretsManagerClient, error) {
+		rbacLog.Info("Attempting to create IBM Secrets Manager client.")
+		return ibm.CreateSecretsManagerClient(apiKey, cfg)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Secrets Manager client: %w", err)
+	}
+
+	pat, err := retry(ctx, func() (string, error) {
+		rbacLog.Info("Attempting to retrieve the GitHub token.")
+		return ibm.GetGitHubPAT(smClient, cfg.SecretsManagerSecretID)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get GitHub PAT: %w", err)
+	}
+
+	return pat, nil
+}
+
+func CreateArgoCDRBAC(c client.Client) error {
 	ctx := context.TODO()
-	client, err := utlis.CreateClient()
+
+	cfg, err := config.LoadFromConfigMap(ctx, c)
 	if err != nil {
 		return err
 	}
 
-	ctrl.Log.WithName("RBAC")
-
-	apiKeyOperation := func() (string, error) {
-		ctrl.Log.Info("Attempting to retrieve IBM API Key.")
-		return ibm.GetIBMAPIKey(ctx)
-	}
-	b := backoff.NewExponentialBackOff()
-	opts := []backoff.RetryOption{
-		backoff.WithBackOff(b),
-		backoff.WithMaxElapsedTime(360 * time.Second),
-	}
-	apiKey, err := backoff.Retry(ctx, apiKeyOperation, opts...)
+	githubPAT, err := getGitHubPAT(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to get IBM API key: %w", err)
+		return err
 	}
-	b.Reset()
 
-	// Step 2: Create the Secrets Manager client (your ibm package logic is unchanged)
-	secretOperation := func() (*sm.SecretsManagerV2, error) {
-		ctrl.Log.Info("Attempting to retrieve IBM Secret Manager Credentials.")
-		return ibm.CreateSecretsManagerClient(apiKey)
-	}
-	smClient, err := backoff.Retry(ctx, secretOperation, opts...)
+	_, err = retry(ctx, func() (*corev1.Secret, error) {
+		rbacLog.Info(fmt.Sprintf("Attempting to create secret: %s.", config.ArgoCDSecretName))
+		return createArgoCDSecret(ctx, c, config.ArgoCDNamespace, config.ArgoCDSecretName, config.ArgoCDRepoURL, config.GitHubUsername, githubPAT)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create Secrets Manager client: %w", err)
+		return fmt.Errorf("failed to create ArgoCD GitHub secret: %w", err)
 	}
-	b.Reset()
-
-	// Step 3: Retrieve the GitHub PAT from Secrets Manager (your ibm package logic is unchanged)
-	githubOperation := func() (string, error) {
-		ctrl.Log.Info("Attempting to retrieve the Github Token.")
-		return ibm.GetGitHubPAT(smClient, SecretID)
-	}
-	githubPAT, err := backoff.Retry(ctx, githubOperation, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to get GitHub PAT: %w", err)
-	}
-	b.Reset()
-
-	secretName := "ibm-connection-auth"
-	username := "x-oauth-basic"
-	namespace := "openshift-gitops"
-	url := "https://github.ibm.com/itz-content/deployer-tekton-tasks.git"
-
-	k8sSecretOperation := func() (*corev1.Secret, error) {
-		ctrl.Log.Info(fmt.Sprintf("Attempting to create secret: %s.", secretName))
-		return createArgoCDSecret(ctx, client, namespace, secretName, url, username, githubPAT)
-	}
-	_, err = backoff.Retry(ctx, k8sSecretOperation, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to create GitHub secret: %w", err)
-	}
-	b.Reset()
 
 	return nil
-
 }
 
 func createArgoCDSecret(ctx context.Context, c client.Client, namespace, secretName, repo, username, pat string) (*corev1.Secret, error) {
@@ -123,27 +118,20 @@ func createArgoCDSecret(ctx context.Context, c client.Client, namespace, secretN
 	return secret, nil
 }
 
-func Run() error {
-	client, _ := utlis.CreateClient()
-	ctrl.Log.WithName("RBAC")
-	err := createPipelineRBAC(client)
-	if err != nil {
-		ctrl.Log.Error(err, err.Error())
+func Run(c client.Client) error {
+	if err := createPipelineRBAC(c); err != nil {
+		rbacLog.Error(err, "Failed to create pipeline RBAC")
 		return err
 	}
-	ctrl.Log.Info("RBAC role created successfully.")
+	rbacLog.Info("RBAC role created successfully.")
 
-	err = createPipelineSecretAndMount(
-		context.TODO(),
-		client,
-		Namespace,
-		ServiceAccount,
-		SecretID,
-		SecretName,
-		GitUserName,
-	)
+	cfg, err := config.LoadFromConfigMap(context.TODO(), c)
 	if err != nil {
-		ctrl.Log.Error(err, "Failed to create required github secret")
+		return err
+	}
+
+	if err := createPipelineSecretAndMount(context.TODO(), c, cfg); err != nil {
+		rbacLog.Error(err, "Failed to create required GitHub secret")
 		return err
 	}
 
@@ -151,7 +139,7 @@ func Run() error {
 }
 
 func createPipelineRBAC(kclient client.Client) error {
-	rbac := &rbacv1.ClusterRoleBinding{
+	crb := &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "ClusterRoleBinding",
 		},
@@ -161,8 +149,8 @@ func createPipelineRBAC(kclient client.Client) error {
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      ServiceAccount,
-				Namespace: Namespace,
+				Name:      config.PipelineServiceAccount,
+				Namespace: config.PipelineNamespace,
 			},
 		},
 		RoleRef: rbacv1.RoleRef{
@@ -172,20 +160,16 @@ func createPipelineRBAC(kclient client.Client) error {
 		},
 	}
 
-	existingRBAC := &rbacv1.ClusterRoleBinding{}
-	err := kclient.Get(context.TODO(), client.ObjectKey{Name: rbac.Name}, existingRBAC)
-
+	existingCRB := &rbacv1.ClusterRoleBinding{}
+	err := kclient.Get(context.TODO(), client.ObjectKey{Name: crb.Name}, existingCRB)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// If it doesn't exist, create it.
-			return kclient.Create(context.TODO(), rbac)
+			return kclient.Create(context.TODO(), crb)
 		}
-		// Return other errors.
 		return err
 	}
 
-	// If it exists, update it if necessary.
-	return kclient.Update(context.TODO(), rbac)
+	return kclient.Update(context.TODO(), crb)
 }
 
 // createGitHubSecret creates a Kubernetes Secret to store the GitHub PAT.
@@ -219,96 +203,51 @@ func createGitHubSecret(ctx context.Context, c client.Client, namespace, secretN
 // mountSecretToServiceAccount mounts a secret to a service account.
 func mountSecretToServiceAccount(ctx context.Context, c client.Client, namespace, saName, secretName string) error {
 	sa := &corev1.ServiceAccount{}
-	err := c.Get(ctx, types.NamespacedName{Name: saName, Namespace: namespace}, sa)
-	if err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: saName, Namespace: namespace}, sa); err != nil {
 		return fmt.Errorf("failed to get service account %s: %w", saName, err)
 	}
 
 	// Check if the secret is already mounted
-	secretExists := false
 	for _, secretRef := range sa.Secrets {
 		if secretRef.Name == secretName {
-			secretExists = true
-			break
+			return nil // already mounted, nothing to do
 		}
 	}
-	if !secretExists {
-		sa.Secrets = append(sa.Secrets, corev1.ObjectReference{Name: secretName})
-		sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: secretName})
-	}
 
-	err = c.Update(ctx, sa)
-	if err != nil {
+	sa.Secrets = append(sa.Secrets, corev1.ObjectReference{Name: secretName})
+	sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: secretName})
+
+	if err := c.Update(ctx, sa); err != nil {
 		return fmt.Errorf("failed to update service account %s: %w", saName, err)
 	}
 
 	return nil
 }
 
-// createPipelineSecretAndMount creates the GitHub secret and mounts it to the specified service account.
-func createPipelineSecretAndMount(ctx context.Context, c client.Client, namespace, saName, secretID, secretName, username string) error {
-	// Step 1: Retrieve the IBM API Key (your ibm package logic is unchanged)
-	apiKeyOperation := func() (string, error) {
-		ctrl.Log.Info("Attempting to retrieve IBM API Key.")
-		return ibm.GetIBMAPIKey(ctx)
-	}
-	b := backoff.NewExponentialBackOff()
-	opts := []backoff.RetryOption{
-		backoff.WithBackOff(b),
-		backoff.WithMaxElapsedTime(360 * time.Second),
-	}
-	apiKey, err := backoff.Retry(ctx, apiKeyOperation, opts...)
+// createPipelineSecretAndMount creates the GitHub secret and mounts it to the pipeline service account.
+func createPipelineSecretAndMount(ctx context.Context, c client.Client, cfg config.OperatorConfig) error {
+	githubPAT, err := getGitHubPAT(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to get IBM API key: %w", err)
+		return err
 	}
-	b.Reset()
 
-	// Step 2: Create the Secrets Manager client (your ibm package logic is unchanged)
-	secretOperation := func() (*sm.SecretsManagerV2, error) {
-		ctrl.Log.Info("Attempting to retrieve IBM Secret Manager Credentials.")
-		return ibm.CreateSecretsManagerClient(apiKey)
-	}
-	smClient, err := backoff.Retry(ctx, secretOperation, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to create Secrets Manager client: %w", err)
-	}
-	b.Reset()
-
-	// Step 3: Retrieve the GitHub PAT from Secrets Manager (your ibm package logic is unchanged)
-	githubOperation := func() (string, error) {
-		ctrl.Log.Info("Attempting to retrieve the Github Token.")
-		return ibm.GetGitHubPAT(smClient, secretID)
-	}
-	githubPAT, err := backoff.Retry(ctx, githubOperation, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to get GitHub PAT: %w", err)
-	}
-	b.Reset()
-
-	// Step 4: Create the Kubernetes Secret using the new client
-	k8sSecretOperation := func() (*corev1.Secret, error) {
-		ctrl.Log.Info(fmt.Sprintf("Attempting to create secret: %s.", secretName))
-		return createGitHubSecret(ctx, c, namespace, secretName, username, githubPAT)
-	}
-	_, err = backoff.Retry(ctx, k8sSecretOperation, opts...)
+	_, err = retry(ctx, func() (*corev1.Secret, error) {
+		rbacLog.Info(fmt.Sprintf("Attempting to create secret: %s.", config.GitHubSecretName))
+		return createGitHubSecret(ctx, c, config.PipelineNamespace, config.GitHubSecretName, config.GitHubUsername, githubPAT)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create GitHub secret: %w", err)
 	}
-	b.Reset()
 
-	// Step 5: Mount the secret to the ServiceAccount using the new client
-	mountOperation := func() (struct{}, error) {
-		ctrl.Log.Info(fmt.Sprintf("Attempting to mount %s to %s.", secretName, saName))
-		err := mountSecretToServiceAccount(ctx, c, namespace, saName, secretName)
-		return struct{}{}, err
-	}
-	_, err = backoff.Retry(ctx, mountOperation, opts...)
+	_, err = retry(ctx, func() (struct{}, error) {
+		rbacLog.Info(fmt.Sprintf("Attempting to mount %s to %s.", config.GitHubSecretName, config.PipelineServiceAccount))
+		return struct{}{}, mountSecretToServiceAccount(ctx, c, config.PipelineNamespace, config.PipelineServiceAccount, config.GitHubSecretName)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to mount secret to service account: %w", err)
 	}
-	b.Reset()
 
-	fmt.Printf("Successfully created and mounted secret %s to service account %s in namespace %s.\n", secretName, saName, namespace)
+	rbacLog.Info(fmt.Sprintf("Successfully created and mounted secret %s to service account %s in namespace %s.", config.GitHubSecretName, config.PipelineServiceAccount, config.PipelineNamespace))
 
 	return nil
 }

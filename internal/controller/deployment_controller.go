@@ -50,9 +50,8 @@ import (
 	console "github.com/openshift/api/console/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	techzonev1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
-	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
 	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
-	rbac "github.ibm.com/itz-content/itz-deployer-operator/pkg/rbac"
 )
 
 // DeploymentReconciler reconciles a Deployment object
@@ -69,155 +68,179 @@ type DeploymentReconciler struct {
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete
 
 const (
-	// Your base Git organization URL
-	gitBaseOrgURL = "https://github.ibm.com/itz-content"
-
+	gitBaseOrgURL         = "https://github.ibm.com/itz-content"
 	pipelineFileName      = "pipeline.yaml"
 	pipelineRunFileName   = "pipelinerun.yaml"
 	postDeploymentMessage = "Post-deployment CRD created."
+	notificationFinalizer = "techzone.ibm.com/console-notification-cleanup"
 )
+
+// ============================================================================
+// Reconcile
+// ============================================================================
 
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
-	kclient, err := utils.CreateClient()
+
+	cfg, err := config.LoadFromConfigMap(ctx, r.Client)
 	if err != nil {
-		logger.Error(err, err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to load operator config: %w", err)
 	}
+
 	deployment := &techzonev1alpha1.Deployment{}
 	if err := r.Get(ctx, req.NamespacedName, deployment); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Deployment resource not found. Ignoring since object must be deleted.")
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Failed to get Deployment")
 		return ctrl.Result{}, err
 	}
 
-	r.ReconcileConsoleNotification(ctx, deployment)
-	// Step 1: Handle the main deployment phase.
-	if deployment.Status.Phase != "Succeeded" && deployment.Status.Phase != "Failed" {
-		result, err := r.reconcileDeploymentPhase(ctx, kclient, deployment, deployment.Spec)
-		if err != nil {
-			return result, err
+	// Handle deletion: clean up the ConsoleNotification before allowing Kubernetes to delete the CR.
+	if !deployment.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(deployment, notificationFinalizer) {
+			logger.Info("Deployment is being deleted, cleaning up ConsoleNotification.")
+			if err := r.deleteConsoleNotification(ctx, deployment); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(deployment, notificationFinalizer)
+			if err := r.Update(ctx, deployment); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
-		// Requeue if the main deployment is not yet complete.
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure our finalizer is registered.
+	if !controllerutil.ContainsFinalizer(deployment, notificationFinalizer) {
+		controllerutil.AddFinalizer(deployment, notificationFinalizer)
+		return ctrl.Result{}, r.Update(ctx, deployment)
+	}
+
+	if err := r.ReconcileConsoleNotification(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to reconcile ConsoleNotification")
+	}
+
+	// Active deployment phase.
+	if deployment.Status.Phase != "Succeeded" && deployment.Status.Phase != "Failed" {
+		if _, err := r.reconcileDeploymentPhase(ctx, deployment, cfg); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// Step 2: If the main deployment succeeded, check for a post-deployment phase.
-	// We'll use a new status field to track if we've already initiated the post-deployment.
-	if deployment.Status.Phase == "Succeeded" && deployment.Spec.PostDeployment.RepoName != "" && deployment.Status.Message != postDeploymentMessage {
-		logger.Info("Main deployment succeeded. Creating a new CRD for post-deployment.")
-
-		// Create a new Deployment object for the post-deployment.
-		postDeployment := &techzonev1alpha1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-post-deploy", deployment.Name),
-				Namespace: deployment.Namespace,
-			},
-			Spec: techzonev1alpha1.DeploymentSpec{
-				RepoName:   deployment.Spec.PostDeployment.RepoName,
-				Release:    deployment.Spec.PostDeployment.Release,
-				Parameters: deployment.Spec.PostDeployment.Parameters,
-				Ansible:    deployment.Spec.PostDeployment.Ansible,
-			},
-		}
-
-		// Set the owner reference so Kubernetes handles garbage collection.
-		if err := ctrl.SetControllerReference(deployment, postDeployment, r.Scheme); err != nil {
-			logger.Error(err, "Failed to set owner reference on post-deployment CRD.")
-			return ctrl.Result{}, err
-		}
-
-		// Create the new Deployment resource in the cluster.
-		if err := kclient.Create(ctx, postDeployment); err != nil {
-			logger.Error(err, "Failed to create post-deployment CRD.")
-			return ctrl.Result{}, err
-		}
-
-		// Update the status of the main deployment to indicate the post-deployment has been initiated.
-		deployment.Status.Message = postDeploymentMessage
-		if err := kclient.Status().Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to update main deployment status after creating post-deployment CRD.")
-			return ctrl.Result{}, err
-		}
-
-		// Return and let the new Deployment CRD be handled by the normal reconcile loop.
-		return ctrl.Result{}, nil
+	// Post-deployment: trigger a follow-up CR if configured and not yet initiated.
+	if deployment.Status.Phase == "Succeeded" &&
+		deployment.Spec.PostDeployment.RepoName != "" &&
+		deployment.Status.Message != postDeploymentMessage {
+		return ctrl.Result{}, r.reconcilePostDeployment(ctx, deployment)
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// reconcileDeploymentPhase encapsulates the core logic for a single deployment.
-func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, kclient client.Client, deployment *techzonev1alpha1.Deployment, spec techzonev1alpha1.DeploymentSpec) (ctrl.Result, error) {
+// reconcilePostDeployment creates a child Deployment CR for the post-deployment phase.
+func (r *DeploymentReconciler) reconcilePostDeployment(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
 	logger := logf.FromContext(ctx)
 
-	gitRepoURL := fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), spec.RepoName)
-
-	// Step 2: Get the IBM API Key and GitHub PAT (this can be a separate helper function)
-	apiKey, err := ibm.GetIBMAPIKey(ctx)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get IBM API key: %w", err)
-	}
-	secretsManagerAPI, err := ibm.CreateSecretsManagerClient(apiKey)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to create secrets manager client: %w", err)
-	}
-	pat, err := ibm.GetGitHubPAT(secretsManagerAPI, "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7")
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get GitHub PAT: %w", err)
+	postDeployment := &techzonev1alpha1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-post-deploy", deployment.Name),
+			Namespace: deployment.Namespace,
+		},
+		Spec: techzonev1alpha1.DeploymentSpec{
+			RepoName:   deployment.Spec.PostDeployment.RepoName,
+			Release:    deployment.Spec.PostDeployment.Release,
+			Parameters: deployment.Spec.PostDeployment.Parameters,
+			Ansible:    deployment.Spec.PostDeployment.Ansible,
+		},
 	}
 
-	// Step 3: Clone the Git repository.
-	repoDir, err := r.cloneRepo(ctx, gitRepoURL, spec.Release, pat)
+	if err := ctrl.SetControllerReference(deployment, postDeployment, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on post-deployment CR: %w", err)
+	}
+	if err := r.Create(ctx, postDeployment); err != nil {
+		return fmt.Errorf("failed to create post-deployment CR: %w", err)
+	}
+
+	deployment.Status.Message = postDeploymentMessage
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to update status after creating post-deployment CR")
+	}
+	return nil
+}
+
+// ============================================================================
+// Deployment phase
+// ============================================================================
+
+// reconcileDeploymentPhase runs the core deploy logic: fetches credentials,
+// clones the repo, then dispatches to either Ansible or Tekton.
+func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, deployment *techzonev1alpha1.Deployment, cfg config.OperatorConfig) (ctrl.Result, error) {
+	logger := logf.FromContext(ctx)
+
+	pat, err := r.getGitHubPAT(ctx, cfg)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	gitRepoURL := fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), deployment.Spec.RepoName)
+	repoDir, err := r.cloneRepo(ctx, gitRepoURL, deployment.Spec.Release, pat)
 	if err != nil {
 		logger.Error(err, "Failed to clone repository")
-		deployment.Status.Phase = "Failed"
-		deployment.Status.Message = fmt.Sprintf("Failed to clone repository: %s", err.Error())
-		if err := kclient.Status().Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to update Deployment status")
-		}
+		r.setFailedStatus(ctx, deployment, fmt.Sprintf("Failed to clone repository: %s", err))
 		return ctrl.Result{}, err
 	}
 	defer os.RemoveAll(repoDir)
 
-	switch {
-	case deployment.Spec.Ansible.AnsiblePlaybook != "":
+	if deployment.Spec.Ansible.AnsiblePlaybook != "" {
 		job, err := r.reconcileJobResources(ctx, deployment, gitRepoURL)
 		if err != nil {
-			logger.Error(err, "Failed to reconcile ansible job resources.")
-		}
-		if err := r.updateStatus(ctx, deployment, job); err != nil {
-			logger.Error(err, "Failed to update Deployment status.")
+			logger.Error(err, "Failed to reconcile Ansible job resources")
 			return ctrl.Result{}, err
 		}
-	default:
-		pipelineRun, err := r.reconcileTektonResources(ctx, deployment, repoDir)
-		if err != nil {
-			logger.Error(err, "Failed to reconcile Tekton resources.")
-			return ctrl.Result{}, err
-		}
-
-		if err := r.updateStatus(ctx, deployment, pipelineRun); err != nil {
-			logger.Error(err, "Failed to update Deployment status")
-			return ctrl.Result{}, err
-		}
+		return ctrl.Result{}, r.updateJobStatus(ctx, deployment, job)
 	}
 
-	// Step 6: Requeue if the Deployment is not yet complete.
-	if deployment.Status.Phase != "Succeeded" && deployment.Status.Phase != "Failed" {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	pipelineRun, err := r.reconcileTektonResources(ctx, deployment, repoDir)
+	if err != nil {
+		logger.Error(err, "Failed to reconcile Tekton resources")
+		return ctrl.Result{}, err
 	}
-
-	// If the pipeline is in a final state (Succeeded or Failed), no need to requeue from here.
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, r.updatePipelineRunStatus(ctx, deployment, pipelineRun)
 }
 
-// Necessary in order for us to access github.ibm.com and the secret manager
+// getGitHubPAT retrieves the IBM API key then fetches the GitHub PAT from Secrets Manager.
+func (r *DeploymentReconciler) getGitHubPAT(ctx context.Context, cfg config.OperatorConfig) (string, error) {
+	apiKey, err := ibm.GetIBMAPIKey(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get IBM API key: %w", err)
+	}
+	smClient, err := ibm.CreateSecretsManagerClient(apiKey, cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Secrets Manager client: %w", err)
+	}
+	pat, err := ibm.GetGitHubPAT(smClient, cfg.SecretsManagerSecretID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get GitHub PAT: %w", err)
+	}
+	return pat, nil
+}
 
-// cloneRepo handles cloning the repository and returns the path to the temporary directory.
-func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoName, release string, pat string) (string, error) {
+// setFailedStatus is a convenience helper to mark a deployment as Failed and persist it.
+func (r *DeploymentReconciler) setFailedStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, message string) {
+	logger := logf.FromContext(ctx)
+	deployment.Status.Phase = "Failed"
+	deployment.Status.Message = message
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to update Deployment status")
+	}
+}
+
+// ============================================================================
+// Git
+// ============================================================================
+
+func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoURL, release, pat string) (string, error) {
 	logger := logf.FromContext(ctx)
 
 	repoDir, err := os.MkdirTemp("", "git-repo")
@@ -225,197 +248,141 @@ func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoName, release 
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	refName := plumbing.ReferenceName(fmt.Sprintf("refs/tags/%s", release))
-
-	logger.Info("Cloning repository", "URL", repoName, "tag", release)
-
-	auth := &http.BasicAuth{
-		Username: "x-oauth-basic",
-		Password: pat,
-	}
+	logger.Info("Cloning repository", "URL", repoURL, "tag", release)
 
 	_, err = git.PlainClone(repoDir, false, &git.CloneOptions{
-		URL:           repoName,
-		ReferenceName: refName,
+		URL:           repoURL,
+		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/tags/%s", release)),
 		SingleBranch:  true,
-		Auth:          auth,
+		Auth:          &http.BasicAuth{Username: config.GitHubUsername, Password: pat},
 	})
-
 	if err != nil {
 		os.RemoveAll(repoDir)
-		return "", fmt.Errorf("failed to clone repository %s with tag %s: %w", repoName, release, err)
+		return "", fmt.Errorf("failed to clone %s at tag %s: %w", repoURL, release, err)
 	}
 
 	return repoDir, nil
 }
 
-// reconcileJobResources handles the Ansible Job creation and status check.
-// It returns the Job object and an error. If reconciliation needs to requeue,
-// the error will be nil and a Requeue result will be set via the context.
+// ============================================================================
+// Ansible / Job
+// ============================================================================
+
 func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deployment *techzonev1alpha1.Deployment, gitRepoURL string) (*batchv1.Job, error) {
 	logger := logf.FromContext(ctx)
-	kclient, err := utils.CreateClient()
-
-	if err != nil {
-		logger.Error(err, "Could not access kclient.")
-	}
-
 	jobName := fmt.Sprintf("%s-ansible-runner", deployment.Name)
+
 	foundJob := &batchv1.Job{}
-
-	err = kclient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: deployment.Namespace}, foundJob)
-	if err != nil && errors.IsNotFound(err) {
-		// Job not found, create it now.
-		logger.Info("Creating new Ansible Job", "Job.Name", jobName)
-		job := r.newAnsibleJob(deployment, jobName, gitRepoURL)
-
-		if err := controllerutil.SetControllerReference(deployment, job, r.Scheme); err != nil {
-			return nil, err
-		}
-
-		if err := kclient.Create(ctx, job); err != nil {
-			return nil, err
-		}
-
-		logger.Info("Ansible job created successfully. Requeuing to monitor status.")
-		deployment.Status.PipelineRunName = job.Name
-
-		if err := kclient.Status().Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to update Deployment status with run name.")
-		}
-
-		return job, nil
-	} else if err != nil {
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: deployment.Namespace}, foundJob)
+	if err != nil && !errors.IsNotFound(err) {
 		return nil, err
 	}
 
-	logger.Info("Found existing Ansible job. Checking status.", "Job.Name", foundJob.Name)
+	if errors.IsNotFound(err) {
+		logger.Info("Creating new Ansible Job", "Job.Name", jobName)
+		job, err := r.newAnsibleJob(deployment, jobName, gitRepoURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build Ansible job spec: %w", err)
+		}
+		if err := controllerutil.SetControllerReference(deployment, job, r.Scheme); err != nil {
+			return nil, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			return nil, err
+		}
+		deployment.Status.PipelineRunName = job.Name
+		if err := r.Status().Update(ctx, deployment); err != nil {
+			logger.Error(err, "Failed to update Deployment status with job name")
+		}
+		return job, nil
+	}
+
+	// Job exists — check its terminal conditions.
 	for _, condition := range foundJob.Status.Conditions {
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			logger.Info("Ansible Job succeeded.", "Job.Name", foundJob.Name)
-			// Job succeeded. Return the job so the main Reconcile function can proceed.
+			logger.Info("Ansible Job succeeded", "Job.Name", foundJob.Name)
 			return foundJob, nil
 		}
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			errMsg := fmt.Sprintf("Ansible Job failed. Reason: %s", condition.Reason)
-			logger.Error(nil, errMsg, "Job.Name", foundJob.Name)
-			// Job failed. Stop reconciliation for this CR.
-			return foundJob, fmt.Errorf("%s", errMsg)
+			return foundJob, fmt.Errorf("ansible Job failed: %s", condition.Reason)
 		}
 	}
 
-	// Job is still running (or pending). Requeue to check status later.
-	logger.Info("Ansible Job still running or pending. Requeueing.", "Job.Name", foundJob.Name)
+	logger.Info("Ansible Job still running", "Job.Name", foundJob.Name)
 	return nil, nil
 }
 
-// newAnsibleJob constructs the Kubernetes Job object based on the Deployment CRD spec.
-// This implements the two-container pattern (Git Cloner + Ansible Runner).
-func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deployment, jobName string, gitRepoURL string) *batchv1.Job {
-	// Define constants for volume and mount path
+// newAnsibleJob constructs the Job spec using the two-container pattern (git-cloner + ansible-runner).
+func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deployment, jobName, gitRepoURL string) (*batchv1.Job, error) {
 	const volumeName = "ansible-repo"
 	const mountPath = "/workspace"
 
-	// Define the shared EmptyDir volume
-	volume := corev1.Volume{
-		Name: volumeName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
-		},
+	parts := strings.SplitN(gitRepoURL, "//", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("malformed git repo URL: %s", gitRepoURL)
 	}
-	volumeMount := corev1.VolumeMount{
-		Name:      volumeName,
-		MountPath: mountPath,
-	}
+	gitAuthURL := fmt.Sprintf("%s//$(GIT_PAT)@%s", parts[0], parts[1])
+
+	volumeMount := corev1.VolumeMount{Name: volumeName, MountPath: mountPath}
 
 	patEnvVar := corev1.EnvVar{
 		Name: "GIT_PAT",
 		ValueFrom: &corev1.EnvVarSource{
 			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: rbac.SecretName,
-				},
-				Key: "password",
+				LocalObjectReference: corev1.LocalObjectReference{Name: config.GitHubSecretName},
+				Key:                  "password",
 			},
 		},
 	}
 
-	parts := strings.SplitN(gitRepoURL, "//", 2)
-	if len(parts) != 2 {
-		// Return error/nil for malformed URL
-		return nil
-	}
-	gitAuthURL := fmt.Sprintf("%s//$(%s)@%s", parts[0], "GIT_PAT", parts[1])
-
-	// Init Container (Git Clone)
 	initContainer := corev1.Container{
 		Name:    "git-cloner",
 		Image:   "alpine/git",
 		Command: []string{"sh", "-c"},
-		Args: []string{
-			fmt.Sprintf(
-				"git clone --single-branch --branch %s %s %s && chmod go-w %s",
-				deployment.Spec.Release,
-				gitAuthURL,
-				mountPath,
-				mountPath,
-			),
-		},
+		Args: []string{fmt.Sprintf(
+			"git clone --single-branch --branch %s %s %s && chmod go-w %s",
+			deployment.Spec.Release, gitAuthURL, mountPath, mountPath,
+		)},
 		ImagePullPolicy: corev1.PullAlways,
 		VolumeMounts:    []corev1.VolumeMount{volumeMount},
 		Env:             []corev1.EnvVar{patEnvVar},
 	}
 
-	playbookPath := mountPath + "/" + deployment.Spec.Ansible.AnsiblePlaybook
-
-	// mandatory args
-	args := []string{
-		playbookPath,
-	}
-
+	// Build the ansible-playbook command, optionally prepending galaxy setup.
+	playbookArgs := []string{mountPath + "/" + deployment.Spec.Ansible.AnsiblePlaybook}
 	if deployment.Spec.Parameters != "" {
-		varsFilePath := mountPath + "/" + deployment.Spec.Parameters
-		args = append(args, "-e", "@"+varsFilePath)
+		playbookArgs = append(playbookArgs, "-e", "@"+mountPath+"/"+deployment.Spec.Parameters)
 	}
 
-	var ansibleGalaxyCmd string
+	var shellCmd string
 	if deployment.Spec.Ansible.Requirements != "" {
-		requirementsFilePath := mountPath + "/" + deployment.Spec.Ansible.Requirements
-
-		ansibleGalaxySetup := "git config --global url.\"https://${GIT_PAT}@github.ibm.com\".insteadOf 	\"https://github.ibm.com\" && "
-
-		ansibleGalaxyInstall := "ansible-galaxy install -r " + requirementsFilePath + " && "
-
-		// No cleanup required since the config is global to this container's session
-		ansibleGalaxyCmd = ansibleGalaxySetup + ansibleGalaxyInstall
+		reqPath := mountPath + "/" + deployment.Spec.Ansible.Requirements
+		shellCmd = fmt.Sprintf(
+			`git config --global url."https://${GIT_PAT}@github.ibm.com".insteadOf "https://github.ibm.com" && ansible-galaxy install -r %s && `,
+			reqPath,
+		)
 	}
-
-	fullPlaybookCmd := "ansible-playbook " + strings.Join(args, " ")
-	shellCommand := ansibleGalaxyCmd + fullPlaybookCmd
+	shellCmd += "ansible-playbook " + strings.Join(playbookArgs, " ")
 
 	isPrivileged := true
 	uidRoot := int64(0)
 
-	securityContext := &corev1.SecurityContext{
-		Privileged: &isPrivileged,
-		RunAsUser:  &uidRoot,
-	}
-
-	// Main Container (Ansible Runner)
 	mainContainer := corev1.Container{
 		Name:            "ansible-runner",
 		Image:           "docker.io/knickkennedy/k8s-tools:v1.0",
 		Command:         []string{"/bin/sh"},
-		Args:            []string{"-c", shellCommand},
+		Args:            []string{"-c", shellCmd},
 		Env:             []corev1.EnvVar{patEnvVar},
 		WorkingDir:      mountPath,
 		ImagePullPolicy: corev1.PullAlways,
 		VolumeMounts:    []corev1.VolumeMount{volumeMount},
-		SecurityContext: securityContext,
+		SecurityContext: &corev1.SecurityContext{
+			Privileged: &isPrivileged,
+			RunAsUser:  &uidRoot,
+		},
 	}
 
 	backoffLimit := int32(3)
-	// Construct the final Job object
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -423,30 +390,36 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 			Labels:    map[string]string{"app": "ansible-runner", "deployment": deployment.Name},
 		},
 		Spec: batchv1.JobSpec{
-			// Setting BackoffLimit=0 ensures no retries on failure (crucial for idempotency)
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyNever,
 					InitContainers:     []corev1.Container{initContainer},
 					Containers:         []corev1.Container{mainContainer},
-					Volumes:            []corev1.Volume{volume},
-					ServiceAccountName: rbac.ServiceAccount,
+					Volumes:            []corev1.Volume{{Name: volumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+					ServiceAccountName: config.PipelineServiceAccount,
 				},
 			},
 		},
-	}
+	}, nil
 }
 
-// reconcileTektonResources clones the Git repo and creates/updates the Tekton Pipeline and PipelineRun.
+// ============================================================================
+// Tekton / PipelineRun
+// ============================================================================
+
 func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, deployment *techzonev1alpha1.Deployment, repoDir string) (*tektonv1.PipelineRun, error) {
 	logger := logf.FromContext(ctx)
-	kclient, err := utils.CreateClient()
-	if err != nil {
-		logger.Error(err, err.Error())
+
+	// If we already launched a PipelineRun, just track it.
+	if deployment.Status.PipelineRunName != "" {
+		existing := &tektonv1.PipelineRun{}
+		if err := r.Get(ctx, types.NamespacedName{Name: deployment.Status.PipelineRunName, Namespace: deployment.Namespace}, existing); err != nil {
+			return nil, fmt.Errorf("failed to get existing PipelineRun: %w", err)
+		}
+		return existing, nil
 	}
 
-	// Read and unmarshal pipeline.yaml
 	pipelineYAML, err := os.ReadFile(filepath.Join(repoDir, pipelineFileName))
 	if err != nil {
 		return nil, fmt.Errorf("could not read pipeline file: %w", err)
@@ -457,7 +430,6 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 	}
 	pipeline.SetNamespace(deployment.Namespace)
 
-	// Read and unmarshal pipelinerun.yaml
 	pipelineRunYAML, err := os.ReadFile(filepath.Join(repoDir, pipelineRunFileName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read PipelineRun file: %w", err)
@@ -468,376 +440,245 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 	}
 	pipelineRun.SetNamespace(deployment.Namespace)
 
-	// If it does, we track it instead of creating a new one.
-	if deployment.Status.PipelineRunName != "" {
-		existingPipelineRun := &tektonv1.PipelineRun{}
-		err := kclient.Get(ctx, types.NamespacedName{Name: deployment.Status.PipelineRunName, Namespace: deployment.Namespace}, existingPipelineRun)
-		if err != nil {
-			// If we can't get the existing PipelineRun, it might have been deleted.
-			// Re-creating it is a valid recovery step, but let's just return an error for now.
-			return nil, fmt.Errorf("failed to get existing PipelineRun: %w", err)
-		}
-		// Return the existing PipelineRun to be tracked by the updateStatus function.
-		return existingPipelineRun, nil
-	}
-
-	// Step 4: Conditionally inject parameters based on WorkloadType.
 	if deployment.Spec.Parameters != "" {
-		paramsPath := filepath.Join(repoDir, deployment.Spec.Parameters)
-		paramsYAML, err := os.ReadFile(paramsPath)
+		paramsYAML, err := os.ReadFile(filepath.Join(repoDir, deployment.Spec.Parameters))
 		if err != nil {
-			return nil, fmt.Errorf("failed to read tekton parameters file: %w", err)
+			return nil, fmt.Errorf("failed to read parameters file: %w", err)
 		}
-		if err := r.mergeParams(&pipelineRun, paramsYAML); err != nil {
+		if err := mergeParams(&pipelineRun, paramsYAML); err != nil {
 			return nil, fmt.Errorf("failed to merge parameters: %w", err)
 		}
 	}
 
-	// Step 5: Create or update the Pipeline.
 	if err := controllerutil.SetControllerReference(deployment, &pipeline, r.Scheme); err != nil {
 		return nil, err
 	}
-	if err := kclient.Create(ctx, &pipeline); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, &pipeline); err != nil && !errors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("failed to create Pipeline: %w", err)
-	} else if errors.IsAlreadyExists(err) {
-		logger.Info("Pipeline already exists, skipping creation.")
 	}
 
-	// Step 6: Create or update the PipelineRun.
 	if err := controllerutil.SetControllerReference(deployment, &pipelineRun, r.Scheme); err != nil {
 		return nil, err
 	}
-
-	if err := kclient.Create(ctx, &pipelineRun); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, &pipelineRun); err != nil && !errors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("failed to create PipelineRun: %w", err)
-	} else if errors.IsAlreadyExists(err) {
-		logger.Info("PipelineRun already exists, skipping creation.")
 	}
 
 	deployment.Status.PipelineRunName = pipelineRun.Name
-
-	if err := kclient.Status().Update(ctx, deployment); err != nil {
-		logger.Error(err, "Failed to update Deployment status with PipelineRun name.")
-		// Don't return here, we still want to return the pipelineRun object for the main reconcile loop
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to update Deployment status with PipelineRun name")
 	}
 
 	return &pipelineRun, nil
 }
 
-// mergeParams reads parameters from a YAML byte slice and merges them into the PipelineRun's Spec.
-func (r *DeploymentReconciler) mergeParams(pipelineRun *tektonv1.PipelineRun, paramsYAML []byte) error {
-	var overrideParams map[string]string
-	if err := yaml.Unmarshal(paramsYAML, &overrideParams); err != nil {
+// mergeParams merges override parameters from YAML into the PipelineRun spec.
+func mergeParams(pipelineRun *tektonv1.PipelineRun, paramsYAML []byte) error {
+	var overrides map[string]string
+	if err := yaml.Unmarshal(paramsYAML, &overrides); err != nil {
 		return fmt.Errorf("failed to unmarshal parameters YAML: %w", err)
 	}
 
-	existingParams := make(map[string]tektonv1.Param)
-	for _, param := range pipelineRun.Spec.Params {
-		existingParams[param.Name] = param
+	index := make(map[string]tektonv1.Param, len(pipelineRun.Spec.Params))
+	for _, p := range pipelineRun.Spec.Params {
+		index[p.Name] = p
 	}
-
-	for name, value := range overrideParams {
-		existingParams[name] = tektonv1.Param{
-			Name: name,
-			Value: tektonv1.ParamValue{
-				Type:      tektonv1.ParamTypeString,
-				StringVal: value,
-			},
+	for name, value := range overrides {
+		index[name] = tektonv1.Param{
+			Name:  name,
+			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: value},
 		}
 	}
 
-	var updatedParams []tektonv1.Param
-	for _, param := range existingParams {
-		updatedParams = append(updatedParams, param)
+	updated := make([]tektonv1.Param, 0, len(index))
+	for _, p := range index {
+		updated = append(updated, p)
 	}
-	pipelineRun.Spec.Params = updatedParams
-
+	pipelineRun.Spec.Params = updated
 	return nil
 }
 
-// Define the interface for status extraction
-// This is not strictly necessary but can make the intent clearer
-type ConditionGetter interface {
-	GetCondition(t apis.ConditionType) *apis.Condition
-	GetConditions() apis.Conditions
+// ============================================================================
+// Status updates
+// ============================================================================
+
+// updatePipelineRunStatus maps a PipelineRun's condition onto the Deployment status.
+func (r *DeploymentReconciler) updatePipelineRunStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, pr *tektonv1.PipelineRun) error {
+	if pr == nil || pr.Status.Conditions == nil {
+		return nil
+	}
+	cond := pr.Status.GetCondition(apis.ConditionSucceeded)
+	return r.applyCondition(ctx, deployment, cond)
 }
 
-// updateStatus checks the status of a Tekton PipelineRun OR a Kubernetes Job
-// and updates the Deployment CRD accordingly.
-func (r *DeploymentReconciler) updateStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, statusObject any) error {
+// updateJobStatus maps a Kubernetes Job's conditions onto the Deployment status.
+func (r *DeploymentReconciler) updateJobStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, job *batchv1.Job) error {
+	if job == nil || job.Status.Conditions == nil {
+		return nil
+	}
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+			return r.applyCondition(ctx, deployment, &apis.Condition{
+				Type:    apis.ConditionSucceeded,
+				Status:  corev1.ConditionTrue,
+				Message: "Kubernetes Job completed successfully.",
+			})
+		}
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			return r.applyCondition(ctx, deployment, &apis.Condition{
+				Type:    apis.ConditionSucceeded,
+				Status:  corev1.ConditionFalse,
+				Message: cond.Message,
+			})
+		}
+	}
+	if job.Status.Active > 0 {
+		return r.applyCondition(ctx, deployment, &apis.Condition{
+			Type:    apis.ConditionSucceeded,
+			Status:  corev1.ConditionUnknown,
+			Message: "Kubernetes Job is in progress.",
+		})
+	}
+	return nil
+}
+
+// applyCondition translates a knative Condition into a Deployment phase and persists it.
+func (r *DeploymentReconciler) applyCondition(ctx context.Context, deployment *techzonev1alpha1.Deployment, cond *apis.Condition) error {
+	if cond == nil {
+		return nil
+	}
 	logger := logf.FromContext(ctx)
-	kclient, err := utils.CreateClient() // kclient is assumed to be an existing kubernetes client
+	switch cond.Status {
+	case corev1.ConditionTrue:
+		deployment.Status.Phase = "Succeeded"
+		deployment.Status.Message = "Resource completed successfully."
+	case corev1.ConditionFalse:
+		deployment.Status.Phase = "Failed"
+		deployment.Status.Message = cond.Message
+	case corev1.ConditionUnknown:
+		deployment.Status.Phase = "Running"
+		deployment.Status.Message = cond.Message
+	}
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to update Deployment status")
+		return err
+	}
+	return nil
+}
 
+// ============================================================================
+// Console notifications
+// ============================================================================
+
+func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
+	logger := logf.FromContext(ctx)
+
+	externalURL, err := r.GetExternalClusterBaseURL(ctx)
 	if err != nil {
-		logger.Error(err, err.Error())
-		return err // Return the error here
+		return err
 	}
 
-	var succeededCondition *apis.Condition
-	var isComplete bool // Flag to check if the status update is complete
+	name := fmt.Sprintf("%s-status-banner", deployment.Name)
+	desired := r.buildNotification(name, externalURL, deployment)
 
-	if statusObject == nil {
-		logger.Info("Status object is currently nil")
-		return nil
+	existing := &console.ConsoleNotification{}
+	err = r.Get(ctx, client.ObjectKey{Name: name}, existing)
+	if errors.IsNotFound(err) {
+		logger.Info("Creating ConsoleNotification", "Name", name)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get ConsoleNotification: %w", err)
 	}
 
-	// 1. Use a type switch to handle different status objects
-	switch obj := statusObject.(type) {
-	case *tektonv1.PipelineRun:
-		// Tekton PipelineRun status logic
-		if obj != nil {
-			if obj.Status.Conditions != nil {
-				succeededCondition = obj.Status.GetCondition(apis.ConditionSucceeded)
-				isComplete = true // We have successfully found the Tekton condition
+	if !reflect.DeepEqual(existing.Spec, desired.Spec) {
+		logger.Info("Updating ConsoleNotification", "Name", name)
+		existing.Spec = desired.Spec
+		if err := r.Update(ctx, existing); err != nil {
+			if errors.IsConflict(err) {
+				return fmt.Errorf("conflict updating ConsoleNotification, requeueing: %w", err)
 			}
-		}
-	case *batchv1.Job:
-		// Kubernetes Job status logic
-		if obj != nil {
-			if obj.Status.Conditions != nil {
-				for _, cond := range obj.Status.Conditions {
-					// A Job is complete if it has a "Complete" condition set to true
-					// or a "Failed" condition set to true. For simplicity, we check
-					// the completion conditions and map them to our Succeeded/Failed/Running phases.
-					if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
-						// Map Job success to a Tekton-like succeeded condition
-						succeededCondition = &apis.Condition{
-							Type:    apis.ConditionSucceeded,
-							Status:  corev1.ConditionTrue,
-							Message: "Kubernetes Job completed successfully.",
-						}
-						isComplete = true
-						break
-					} else if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
-						// Map Job failure to a Tekton-like succeeded condition (but False)
-						succeededCondition = &apis.Condition{
-							Type:    apis.ConditionSucceeded,
-							Status:  corev1.ConditionFalse,
-							Message: cond.Message, // Use the Job's failure message
-						}
-						isComplete = true
-						break
-					}
-				}
-			}
-
-			// If the Job isn't explicitly Complete or Failed, it's considered Running.
-			if !isComplete && obj.Status.Active > 0 {
-				// Set a "Running" status similar to Tekton's ConditionUnknown
-				succeededCondition = &apis.Condition{
-					Type:    apis.ConditionSucceeded,
-					Status:  corev1.ConditionUnknown,
-					Message: "Kubernetes Job is in progress.",
-				}
-				isComplete = true
-			}
-		}
-	default:
-		// Handle unsupported type
-		logger.Info("Unsupported status object type provided", "type", fmt.Sprintf("%T", statusObject))
-		return nil
-	}
-
-	// 2. Common status update logic
-	if succeededCondition != nil {
-		switch succeededCondition.Status {
-		case corev1.ConditionTrue:
-			deployment.Status.Phase = "Succeeded"
-			deployment.Status.Message = "Resource completed successfully."
-		case corev1.ConditionFalse:
-			deployment.Status.Phase = "Failed"
-			deployment.Status.Message = succeededCondition.Message
-		case corev1.ConditionUnknown:
-			deployment.Status.Phase = "Running"
-			deployment.Status.Message = succeededCondition.Message // Use the derived running message
-		default:
-			// Optionally handle other statuses if necessary
-		}
-
-		// 3. Update the Deployment CRD
-		if err := kclient.Status().Update(ctx, deployment); err != nil {
-			logger.Error(err, "Failed to update Deployment status")
 			return err
 		}
 	}
 
-	// If it's a Job that hasn't started yet (no Active/Complete/Failed count > 0) or
-	// a PipelineRun without conditions, the loop will continue reconciling until it gets a status.
 	return nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// buildNotification constructs the desired ConsoleNotification for the current deployment phase.
+func (r *DeploymentReconciler) buildNotification(name, externalURL string, deployment *techzonev1alpha1.Deployment) *console.ConsoleNotification {
+	podLink := &console.Link{
+		Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+		Text: "See more information in the pods here.",
+	}
+
+	var text, color string
+	switch deployment.Status.Phase {
+	case "Failed":
+		text = fmt.Sprintf("CR '%s' failed: %s", deployment.Name, deployment.Status.Message)
+		color = "#C00000"
+	case "Running":
+		text = fmt.Sprintf("CR '%s' is running...", deployment.Name)
+		color = "#0043CE"
+	case "Succeeded":
+		text = fmt.Sprintf("CR '%s' is finished!", deployment.Name)
+		color = "#198038"
+	default:
+		text = fmt.Sprintf("CR '%s' is starting...", deployment.Name)
+		color = "#6929C4"
+	}
+
+	return &console.ConsoleNotification{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: console.GroupVersion.String(),
+			Kind:       "ConsoleNotification",
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: console.ConsoleNotificationSpec{
+			Text:            text,
+			Link:            podLink,
+			Location:        console.BannerTop,
+			BackgroundColor: color,
+		},
+	}
+}
+
+// deleteConsoleNotification deletes the ConsoleNotification associated with a Deployment CR.
+func (r *DeploymentReconciler) deleteConsoleNotification(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
+	name := fmt.Sprintf("%s-status-banner", deployment.Name)
+	notification := &console.ConsoleNotification{}
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, notification); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get ConsoleNotification %s: %w", name, err)
+	}
+	if err := r.Delete(ctx, notification); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete ConsoleNotification %s: %w", name, err)
+	}
+	return nil
+}
+
+// GetExternalClusterBaseURL fetches the public host of the OpenShift Console route.
+func (r *DeploymentReconciler) GetExternalClusterBaseURL(ctx context.Context) (string, error) {
+	consoleRoute := &routev1.Route{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "openshift-console", Name: "console"}, consoleRoute); err != nil {
+		return "", fmt.Errorf("failed to get OpenShift console Route: %w", err)
+	}
+	if consoleRoute.Spec.Host == "" {
+		return "", fmt.Errorf("console route spec.host is empty")
+	}
+	return fmt.Sprintf("https://%s", consoleRoute.Spec.Host), nil
+}
+
+// ============================================================================
+// Manager setup
+// ============================================================================
+
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&techzonev1alpha1.Deployment{}).
 		Named("deployment").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 5}).
 		Complete(r)
-}
-
-func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
-	// 1. Define the desired notification object based on the current phase
-	var desiredNotification *console.ConsoleNotification
-	logger := logf.FromContext(ctx)
-	kclient, err := utils.CreateClient()
-
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Checking console notification banner.")
-	// Use a unique, predictable name for the notification
-	name := fmt.Sprintf("%s-status-banner", deployment.Name)
-	externalURL, err := r.GetExternalClusterBaseURL(ctx)
-
-	if err != nil {
-		return err
-	}
-
-	switch deployment.Status.Phase {
-	case "Failed":
-		// Create a persistent, non-dismissible red alert banner
-		desiredNotification = &console.ConsoleNotification{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: console.GroupVersion.String(),
-				Kind:       "ConsoleNotification",
-			},
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec: console.ConsoleNotificationSpec{
-				Text: fmt.Sprintf("CR '%s' failed: %s", deployment.Name, deployment.Status.Message),
-				Link: &console.Link{
-					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
-					Text: "See more information in the pods here.",
-				},
-				Location:        console.BannerTop,
-				BackgroundColor: "#C00000", // Dark Red for critical failure
-			},
-		}
-	case "Running":
-		// Create a temporary, dismissible yellow banner for long operations
-		desiredNotification = &console.ConsoleNotification{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: console.GroupVersion.String(),
-				Kind:       "ConsoleNotification",
-			},
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec: console.ConsoleNotificationSpec{
-				Text: fmt.Sprintf("CR '%s' is running (Phase: %s)...", deployment.Name, deployment.Status.Phase),
-				Link: &console.Link{
-					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
-					Text: "See more information in the pods here.",
-				},
-				Location:        console.BannerTop,
-				BackgroundColor: "#006699",
-			},
-		}
-	case "Succeeded":
-		// Fall through to delete the notification if it exists
-		desiredNotification = &console.ConsoleNotification{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: console.GroupVersion.String(),
-				Kind:       "ConsoleNotification",
-			},
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec: console.ConsoleNotificationSpec{
-				Text: fmt.Sprintf("CR '%s' is finished! (Phase: %s)...", deployment.Name, deployment.Status.Phase),
-				Link: &console.Link{
-					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
-					Text: "See more information in the pods here.",
-				},
-				Location:        console.BannerTop,
-				BackgroundColor: "#4CAF50",
-			},
-		}
-	default:
-		desiredNotification = &console.ConsoleNotification{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: console.GroupVersion.String(),
-				Kind:       "ConsoleNotification",
-			},
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec: console.ConsoleNotificationSpec{
-				Text: fmt.Sprintf("CR '%s' is starting...", deployment.Name),
-				Link: &console.Link{
-					Href: externalURL + "/k8s/ns/default/core~v1~Pod",
-					Text: "See more information in the pods here.",
-				},
-				Location:        console.BannerTop,
-				BackgroundColor: "#FFD700",
-			},
-		}
-	}
-
-	existingNotification := &console.ConsoleNotification{}
-	key := client.ObjectKey{Name: name}
-
-	err = kclient.Get(ctx, key, existingNotification)
-
-	if err != nil && errors.IsNotFound(err) {
-		// The desiredNotification already has the correct Spec set from the switch case
-		logger.Info("Creating ConsoleNotification banner", "Name", name)
-		if createErr := kclient.Create(ctx, desiredNotification); createErr != nil {
-			logger.Error(createErr, "Failed to create ConsoleNotification")
-			return createErr
-		}
-
-	} else if err == nil {
-		// B.2. Resource exists: UPDATE it.
-
-		if !reflect.DeepEqual(existingNotification.Spec, desiredNotification.Spec) {
-
-			existingNotification.Spec = desiredNotification.Spec
-
-			logger.Info("Updating ConsoleNotification banner", "Name", name)
-			if updateErr := kclient.Update(ctx, existingNotification); updateErr != nil {
-				if errors.IsConflict(updateErr) {
-					return fmt.Errorf("conflict during ConsoleNotification update, requeueing: %w", updateErr)
-				}
-				logger.Error(updateErr, "Failed to update ConsoleNotification")
-				return updateErr
-			}
-		} else {
-			logger.V(1).Info("ConsoleNotification already in desired state, skipping update.")
-		}
-
-	} else {
-		// B.3. Failed to Get for an unknown reason.
-		logger.Error(err, "Failed to get ConsoleNotification during update check")
-		return err
-	}
-
-	return nil
-}
-
-// GetExternalClusterBaseURL fetches the public host address of the OpenShift Console.
-func (r *DeploymentReconciler) GetExternalClusterBaseURL(ctx context.Context) (string, error) {
-	kclient, err := utils.CreateClient()
-
-	if err != nil {
-		return "", err
-	}
-
-	// 1. Define the target Route key (namespace and name)
-	routeKey := types.NamespacedName{
-		Namespace: "openshift-console",
-		Name:      "console",
-	}
-
-	consoleRoute := &routev1.Route{}
-
-	// 2. Fetch the Route object
-	err = kclient.Get(ctx, routeKey, consoleRoute)
-	if err != nil {
-		// If the Route isn't found, log a warning (it may not exist in non-OCP clusters)
-		return "", fmt.Errorf("failed to get OpenShift console Route: %w", err)
-	}
-
-	// 3. Extract the public host
-	host := consoleRoute.Spec.Host
-	if host == "" {
-		return "", fmt.Errorf("console route spec.host is empty")
-	}
-
-	// Routes are always HTTPS by default in OpenShift, but prepend 'https://' for certainty.
-	return fmt.Sprintf("https://%s", host), nil
 }

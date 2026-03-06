@@ -26,6 +26,12 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	v1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
+	configv1 "github.com/openshift/api/config/v1"
+	consolev1 "github.com/openshift/api/console/v1"
+	routev1 "github.com/openshift/api/route/v1"
+	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -39,6 +45,7 @@ import (
 
 	techzonev1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
 	"github.ibm.com/itz-content/itz-deployer-operator/internal/controller"
+	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/argocd"
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/rbac"
 	// +kubebuilder:scaffold:imports
@@ -51,8 +58,13 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	utilruntime.Must(techzonev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(consolev1.AddToScheme(scheme))         // ConsolePlugin
+	utilruntime.Must(routev1.AddToScheme(scheme))           // OpenShift routes
+	utilruntime.Must(configv1.AddToScheme(scheme))          // ClusterVersion
+	utilruntime.Must(operatorsv1alpha1.AddToScheme(scheme)) // OLM
+	utilruntime.Must(v1beta1.AddToScheme(scheme))           // ExternalSecrets
+	utilruntime.Must(pipelinev1.AddToScheme(scheme))        // Tekton
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -91,25 +103,16 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
+	// Disable HTTP/2 by default to avoid Stream Cancellation and Rapid Reset CVEs.
 	disableHTTP2 := func(c *tls.Config) {
 		setupLog.Info("disabling http/2")
 		c.NextProtos = []string{"http/1.1"}
 	}
-
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	// Create watchers for metrics and webhooks certificates
 	var metricsCertWatcher, webhookCertWatcher *certwatcher.CertWatcher
-
-	// Initial webhook TLS options
 	webhookTLSOpts := tlsOpts
 
 	if len(webhookCertPath) > 0 {
@@ -125,7 +128,6 @@ func main() {
 			setupLog.Error(err, "Failed to initialize webhook certificate watcher")
 			os.Exit(1)
 		}
-
 		webhookTLSOpts = append(webhookTLSOpts, func(config *tls.Config) {
 			config.GetCertificate = webhookCertWatcher.GetCertificate
 		})
@@ -135,32 +137,15 @@ func main() {
 		TLSOpts: webhookTLSOpts,
 	})
 
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
-	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/metrics/server
-	// - https://book.kubebuilder.io/reference/metrics.html
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   metricsAddr,
 		SecureServing: secureMetrics,
 		TLSOpts:       tlsOpts,
 	}
-
 	if secureMetrics {
-		// FilterProvider is used to protect the metrics endpoint with authn/authz.
-		// These configurations ensure that only authorized users and service accounts
-		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
-		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/metrics/filters#WithAuthenticationAndAuthorization
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
-	// If the certificate is not specified, controller-runtime will automatically
-	// generate self-signed certificates for the metrics server. While convenient for development and testing,
-	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -174,7 +159,6 @@ func main() {
 			setupLog.Error(err, "to initialize metrics certificate watcher", "error", err)
 			os.Exit(1)
 		}
-
 		metricsServerOptions.TLSOpts = append(metricsServerOptions.TLSOpts, func(config *tls.Config) {
 			config.GetCertificate = metricsCertWatcher.GetCertificate
 		})
@@ -187,17 +171,6 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "20eb548c.techzone.ibm.com",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -230,8 +203,19 @@ func main() {
 		}
 	}
 
-	rbac.Run()
-	argocd.Run()
+	// Build a client for pre-manager setup (rbac, argocd). These run before
+	// mgr.Start() so they cannot use the manager's cached client.
+	preClient, err := utils.NewClient(scheme)
+	if err != nil {
+		setupLog.Error(err, "unable to create pre-manager kube client")
+		os.Exit(1)
+	}
+
+	if err := rbac.Run(preClient); err != nil {
+		setupLog.Error(err, "rbac setup failed")
+		os.Exit(1)
+	}
+	argocd.Run(preClient)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

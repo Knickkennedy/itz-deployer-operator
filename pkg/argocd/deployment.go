@@ -8,7 +8,9 @@ import (
 
 	routev1 "github.com/openshift/api/route/v1"
 	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,23 +26,21 @@ type ArgoCDResource struct {
 	Clusters  []string `json:"clusters"`
 }
 
-var name = "openshift-gitops"
-
-func argoDeployment(client client.Client) error {
-	u, err := getDeployment(client, name, "openshift-gitops")
-	if err != nil {
-		argoCDLog.Error(err, err.Error())
+func argoDeployment(kclient client.Client) error {
+	u, err := getDeployment(kclient, config.ArgoCDInstanceName, config.ArgoCDNamespace)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check for existing ArgoCD deployment: %w", err)
 	}
 
-	isDeployed := (u.GetName() == name)
-	if !isDeployed {
+	if u.GetName() != config.ArgoCDInstanceName {
 		argoCDLog.Info("ArgoCD deployment not found... deploying now.")
-		createDeployment(client)
+		if err := createDeployment(kclient); err != nil {
+			return err
+		}
 	}
+
 	argoCDLog.Info("Waiting for ArgoCD Deployment to be ready...")
-	err = waitForDeployment(client)
-	if err != nil {
-		argoCDLog.Error(err, err.Error())
+	if err := waitForDeployment(kclient); err != nil {
 		return err
 	}
 	argoCDLog.Info("ArgoCD ready! Now installing application")
@@ -306,7 +306,7 @@ func waitForDeployment(kclient client.Client) error {
 			return errors.New("deployment took too long to become ready")
 
 		case <-ticker.C:
-			u, err := getDeployment(kclient, name, "openshift-gitops")
+			u, err := getDeployment(kclient, config.ArgoCDInstanceName, config.ArgoCDNamespace)
 			if err != nil {
 				argoCDLog.Error(err, "Failed to get ArgoCD Deployment")
 				continue // Don't fail immediately; keep retrying

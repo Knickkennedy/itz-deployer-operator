@@ -5,6 +5,7 @@ go 1.24.4
 require (
 	github.com/IBM/go-sdk-core/v5 v5.21.0
 	github.com/IBM/secrets-manager-go-sdk/v2 v2.0.15
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/external-secrets/external-secrets v0.19.1
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/go-logr/logr v1.4.3
@@ -34,7 +35,6 @@ require (
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/blendle/zapdriver v1.3.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.1 // indirect

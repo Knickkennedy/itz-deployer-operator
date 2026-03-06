@@ -7,39 +7,44 @@ import (
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	sm "github.com/IBM/secrets-manager-go-sdk/v2/secretsmanagerv2"
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
+// SecretsManagerClient is an interface over *sm.SecretsManagerV2, allowing
+// the type to be used as a generic type parameter in retry helpers.
+type SecretsManagerClient = *sm.SecretsManagerV2
+
 func GetIBMAPIKey(ctx context.Context) (string, error) {
 	// Creates a Kubernetes client from the in-cluster configuration
-	config, err := rest.InClusterConfig()
+	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return "", fmt.Errorf("failed to get in-cluster config: %w", err)
 	}
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return "", fmt.Errorf("failed to create clientset: %w", err)
 	}
 
 	// Get the secret from the kube-system namespace
-	secret, err := clientset.CoreV1().Secrets("kube-system").Get(ctx, "ibm-secret", metav1.GetOptions{})
+	secret, err := clientset.CoreV1().Secrets(config.IBMSecretNamespace).Get(ctx, config.IBMSecretName, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to get secret 'ibm-secret': %w", err)
+		return "", fmt.Errorf("failed to get secret '%s': %w", config.IBMSecretName, err)
 	}
 
 	// Extract the API key from the secret's data.
 	apiKey, ok := secret.Data["apiKey"]
 	if !ok {
-		return "", fmt.Errorf("apiKey not found in secret 'ibm-secret'")
+		return "", fmt.Errorf("apiKey not found in secret '%s'", config.IBMSecretName)
 	}
 
 	return string(apiKey), nil
 }
 
-func CreateSecretsManagerClient(apiKey string) (*sm.SecretsManagerV2, error) {
+func CreateSecretsManagerClient(apiKey string, cfg config.OperatorConfig) (*sm.SecretsManagerV2, error) {
 	// Create an IAM authenticator with your API key
 	authenticator := &core.IamAuthenticator{
 		ApiKey: apiKey,
@@ -50,7 +55,7 @@ func CreateSecretsManagerClient(apiKey string) (*sm.SecretsManagerV2, error) {
 	// e.g., "https://{instance_ID}.us-south.secrets-manager.appdomain.cloud"
 	secretsManagerAPI, err := sm.NewSecretsManagerV2(&sm.SecretsManagerV2Options{
 		Authenticator: authenticator,
-		URL:           "https://afa20521-cd75-4864-843f-e59fd0ffd49d.us-south.secrets-manager.appdomain.cloud", // Replace with your instance URL
+		URL:           cfg.SecretsManagerURL, // Replace with your instance URL
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create secrets manager client: %w", err)
