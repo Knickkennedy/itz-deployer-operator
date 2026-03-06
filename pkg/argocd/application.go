@@ -7,6 +7,7 @@ import (
 
 	"strconv"
 
+	rbac "github.ibm.com/itz-content/itz-deployer-operator/pkg/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,6 +48,9 @@ func getApplication(kclient client.Client) (bool, error) {
 }
 
 func createApplication(kclient client.Client) {
+
+	rbac.CreateArgoCDRBAC()
+
 	application := &unstructured.Unstructured{}
 	application.Object = map[string]any{
 		"metadata": map[string]any{
@@ -64,7 +68,7 @@ func createApplication(kclient client.Client) {
 					"recurse": true,
 					"exclude": "{**/*/catalog-info.yaml,**/*/tests/**}",
 				},
-				"repoURL":        "https://github.com/itz-public/deployer-tekton-tasks.git",
+				"repoURL":        "https://github.ibm.com/itz-content/deployer-tekton-tasks.git",
 				"targetRevision": "main",
 				"path":           "tasks",
 			},

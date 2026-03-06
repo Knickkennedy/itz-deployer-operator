@@ -351,17 +351,19 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 	initContainer := corev1.Container{
 		Name:    "git-cloner",
 		Image:   "alpine/git",
-		Command: []string{"git"},
+		Command: []string{"sh", "-c"},
 		Args: []string{
-			"clone",
-			"--single-branch",
-			"--branch",
-			deployment.Spec.Release,
-			gitAuthURL,
-			mountPath,
+			fmt.Sprintf(
+				"git clone --single-branch --branch %s %s %s && chmod go-w %s",
+				deployment.Spec.Release,
+				gitAuthURL,
+				mountPath,
+				mountPath,
+			),
 		},
-		VolumeMounts: []corev1.VolumeMount{volumeMount},
-		Env:          []corev1.EnvVar{patEnvVar},
+		ImagePullPolicy: corev1.PullAlways,
+		VolumeMounts:    []corev1.VolumeMount{volumeMount},
+		Env:             []corev1.EnvVar{patEnvVar},
 	}
 
 	playbookPath := mountPath + "/" + deployment.Spec.Ansible.AnsiblePlaybook
@@ -376,16 +378,43 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 		args = append(args, "-e", "@"+varsFilePath)
 	}
 
-	// Main Container (Ansible Runner)
-	mainContainer := corev1.Container{
-		Name:         "ansible-runner",
-		Image:        "docker.io/knickkennedy/k8s-tools@sha256:542002707d909d25b3ed05654f77c514a507b1fc916ad3d44adb5a672adb4299",
-		Command:      []string{"ansible-playbook"},
-		Args:         args,
-		WorkingDir:   mountPath,
-		VolumeMounts: []corev1.VolumeMount{volumeMount},
+	var ansibleGalaxyCmd string
+	if deployment.Spec.Ansible.Requirements != "" {
+		requirementsFilePath := mountPath + "/" + deployment.Spec.Ansible.Requirements
+
+		ansibleGalaxySetup := "git config --global url.\"https://${GIT_PAT}@github.ibm.com\".insteadOf 	\"https://github.ibm.com\" && "
+
+		ansibleGalaxyInstall := "ansible-galaxy install -r " + requirementsFilePath + " && "
+
+		// No cleanup required since the config is global to this container's session
+		ansibleGalaxyCmd = ansibleGalaxySetup + ansibleGalaxyInstall
 	}
 
+	fullPlaybookCmd := "ansible-playbook " + strings.Join(args, " ")
+	shellCommand := ansibleGalaxyCmd + fullPlaybookCmd
+
+	isPrivileged := true
+	uidRoot := int64(0)
+
+	securityContext := &corev1.SecurityContext{
+		Privileged: &isPrivileged,
+		RunAsUser:  &uidRoot,
+	}
+
+	// Main Container (Ansible Runner)
+	mainContainer := corev1.Container{
+		Name:            "ansible-runner",
+		Image:           "docker.io/knickkennedy/k8s-tools:v1.0",
+		Command:         []string{"/bin/sh"},
+		Args:            []string{"-c", shellCommand},
+		Env:             []corev1.EnvVar{patEnvVar},
+		WorkingDir:      mountPath,
+		ImagePullPolicy: corev1.PullAlways,
+		VolumeMounts:    []corev1.VolumeMount{volumeMount},
+		SecurityContext: securityContext,
+	}
+
+	backoffLimit := int32(3)
 	// Construct the final Job object
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -395,13 +424,14 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 		},
 		Spec: batchv1.JobSpec{
 			// Setting BackoffLimit=0 ensures no retries on failure (crucial for idempotency)
-			BackoffLimit: new(int32),
+			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy:  corev1.RestartPolicyNever,
-					InitContainers: []corev1.Container{initContainer},
-					Containers:     []corev1.Container{mainContainer},
-					Volumes:        []corev1.Volume{volume},
+					RestartPolicy:      corev1.RestartPolicyNever,
+					InitContainers:     []corev1.Container{initContainer},
+					Containers:         []corev1.Container{mainContainer},
+					Volumes:            []corev1.Volume{volume},
+					ServiceAccountName: rbac.ServiceAccount,
 				},
 			},
 		},

@@ -30,6 +30,99 @@ const (
 	SecretID       = "4560e15e-8fb8-37d9-35f5-01fe2c4b77a7"
 )
 
+func CreateArgoCDRBAC() error {
+	ctx := context.TODO()
+	client, err := utlis.CreateClient()
+	if err != nil {
+		return err
+	}
+
+	ctrl.Log.WithName("RBAC")
+
+	apiKeyOperation := func() (string, error) {
+		ctrl.Log.Info("Attempting to retrieve IBM API Key.")
+		return ibm.GetIBMAPIKey(ctx)
+	}
+	b := backoff.NewExponentialBackOff()
+	opts := []backoff.RetryOption{
+		backoff.WithBackOff(b),
+		backoff.WithMaxElapsedTime(360 * time.Second),
+	}
+	apiKey, err := backoff.Retry(ctx, apiKeyOperation, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to get IBM API key: %w", err)
+	}
+	b.Reset()
+
+	// Step 2: Create the Secrets Manager client (your ibm package logic is unchanged)
+	secretOperation := func() (*sm.SecretsManagerV2, error) {
+		ctrl.Log.Info("Attempting to retrieve IBM Secret Manager Credentials.")
+		return ibm.CreateSecretsManagerClient(apiKey)
+	}
+	smClient, err := backoff.Retry(ctx, secretOperation, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to create Secrets Manager client: %w", err)
+	}
+	b.Reset()
+
+	// Step 3: Retrieve the GitHub PAT from Secrets Manager (your ibm package logic is unchanged)
+	githubOperation := func() (string, error) {
+		ctrl.Log.Info("Attempting to retrieve the Github Token.")
+		return ibm.GetGitHubPAT(smClient, SecretID)
+	}
+	githubPAT, err := backoff.Retry(ctx, githubOperation, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to get GitHub PAT: %w", err)
+	}
+	b.Reset()
+
+	secretName := "ibm-connection-auth"
+	username := "x-oauth-basic"
+	namespace := "openshift-gitops"
+	url := "https://github.ibm.com/itz-content/deployer-tekton-tasks.git"
+
+	k8sSecretOperation := func() (*corev1.Secret, error) {
+		ctrl.Log.Info(fmt.Sprintf("Attempting to create secret: %s.", secretName))
+		return createArgoCDSecret(ctx, client, namespace, secretName, url, username, githubPAT)
+	}
+	_, err = backoff.Retry(ctx, k8sSecretOperation, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to create GitHub secret: %w", err)
+	}
+	b.Reset()
+
+	return nil
+
+}
+
+func createArgoCDSecret(ctx context.Context, c client.Client, namespace, secretName, repo, username, pat string) (*corev1.Secret, error) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"argocd.argoproj.io/secret-type": "repository",
+			},
+		},
+		Type: corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{
+			"url":      repo,
+			"username": username,
+			"password": pat,
+		},
+	}
+
+	err := c.Create(ctx, secret)
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			return secret, nil
+		}
+		return nil, fmt.Errorf("failed to create secret %s in namespace %s: %w", secretName, namespace, err)
+	}
+
+	return secret, nil
+}
+
 func Run() error {
 	client, _ := utlis.CreateClient()
 	ctrl.Log.WithName("RBAC")
