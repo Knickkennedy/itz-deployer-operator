@@ -32,11 +32,14 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -47,7 +50,11 @@ import (
 	"github.ibm.com/itz-content/itz-deployer-operator/internal/controller"
 	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/argocd"
+
+	_ "github.ibm.com/itz-content/itz-deployer-operator/pkg/metrics" // register Prometheus metrics
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/rbac"
+	corev1 "k8s.io/api/core/v1" // For &corev1.Pod{}
+	// For labels.Nothing()
 	// +kubebuilder:scaffold:imports
 )
 
@@ -171,6 +178,12 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "20eb548c.techzone.ibm.com",
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{ // Use cache.ByObject here
+				&corev1.Pod{}:  {Label: labels.Nothing()}, // Use Label instead of LabelSelector
+				&corev1.Node{}: {Label: labels.Nothing()},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -183,6 +196,21 @@ func main() {
 		Config: mgr.GetConfig(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")
+		os.Exit(1)
+	}
+
+	operatorNS, err := controller.OperatorNamespace()
+	if err != nil {
+		setupLog.Error(err, "unable to determine operator namespace")
+		os.Exit(1)
+	}
+	if err := (&controller.CapacityReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Namespace: operatorNS,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Capacity")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

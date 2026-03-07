@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,12 +33,13 @@ import (
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -48,17 +50,25 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	console "github.com/openshift/api/console/v1"
-	routev1 "github.com/openshift/api/route/v1"
 	techzonev1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
-	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
 )
 
-// DeploymentReconciler reconciles a Deployment object
+// sentinel errors
+var errEmptyRouteHost = errors.New("console route spec.host is empty")
+
+// DeploymentReconciler reconciles a Deployment object.
 type DeploymentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Config *rest.Config
+
+	// Swappable dependencies — production values wired by SetupWithManager,
+	// test values injected directly in unit/integration tests.
+	Loader   ConfigLoader
+	Creds    CredentialProvider
+	Cloner   RepoCloner
+	Resolver RouteResolver
 }
 
 // +kubebuilder:rbac:groups=techzone.techzone.ibm.com,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -73,6 +83,11 @@ const (
 	pipelineRunFileName   = "pipelinerun.yaml"
 	postDeploymentMessage = "Post-deployment CRD created."
 	notificationFinalizer = "techzone.ibm.com/console-notification-cleanup"
+
+	// Standard condition types for the Deployment CR.
+	ConditionReady       = "Ready"
+	ConditionProgressing = "Progressing"
+	ConditionDegraded    = "Degraded"
 )
 
 // ============================================================================
@@ -82,14 +97,14 @@ const (
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
-	cfg, err := config.LoadFromConfigMap(ctx, r.Client)
+	cfg, err := r.Loader.Load(ctx, r.Client)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to load operator config: %w", err)
 	}
 
 	deployment := &techzonev1alpha1.Deployment{}
 	if err := r.Get(ctx, req.NamespacedName, deployment); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -178,19 +193,19 @@ func (r *DeploymentReconciler) reconcilePostDeployment(ctx context.Context, depl
 func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, deployment *techzonev1alpha1.Deployment, cfg config.OperatorConfig) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
-	pat, err := r.getGitHubPAT(ctx, cfg)
+	pat, err := r.Creds.GetGitHubPAT(ctx, cfg)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	gitRepoURL := fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), deployment.Spec.RepoName)
-	repoDir, err := r.cloneRepo(ctx, gitRepoURL, deployment.Spec.Release, pat)
+	repoDir, cleanup, err := r.Cloner.Clone(ctx, gitRepoURL, deployment.Spec.Release, pat)
 	if err != nil {
 		logger.Error(err, "Failed to clone repository")
 		r.setFailedStatus(ctx, deployment, fmt.Sprintf("Failed to clone repository: %s", err))
 		return ctrl.Result{}, err
 	}
-	defer os.RemoveAll(repoDir)
+	defer cleanup()
 
 	if deployment.Spec.Ansible.AnsiblePlaybook != "" {
 		job, err := r.reconcileJobResources(ctx, deployment, gitRepoURL)
@@ -209,38 +224,12 @@ func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, dep
 	return ctrl.Result{}, r.updatePipelineRunStatus(ctx, deployment, pipelineRun)
 }
 
-// getGitHubPAT retrieves the IBM API key then fetches the GitHub PAT from Secrets Manager.
-func (r *DeploymentReconciler) getGitHubPAT(ctx context.Context, cfg config.OperatorConfig) (string, error) {
-	apiKey, err := ibm.GetIBMAPIKey(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to get IBM API key: %w", err)
-	}
-	smClient, err := ibm.CreateSecretsManagerClient(apiKey, cfg)
-	if err != nil {
-		return "", fmt.Errorf("failed to create Secrets Manager client: %w", err)
-	}
-	pat, err := ibm.GetGitHubPAT(smClient, cfg.SecretsManagerSecretID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get GitHub PAT: %w", err)
-	}
-	return pat, nil
-}
-
-// setFailedStatus is a convenience helper to mark a deployment as Failed and persist it.
-func (r *DeploymentReconciler) setFailedStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, message string) {
-	logger := logf.FromContext(ctx)
-	deployment.Status.Phase = "Failed"
-	deployment.Status.Message = message
-	if err := r.Status().Update(ctx, deployment); err != nil {
-		logger.Error(err, "Failed to update Deployment status")
-	}
-}
-
 // ============================================================================
-// Git
+// Git — implementation functions called by realRepoCloner
 // ============================================================================
 
-func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoURL, release, pat string) (string, error) {
+// cloneRepoImpl is the pure git clone logic, decoupled from the reconciler struct.
+func cloneRepoImpl(ctx context.Context, repoURL, release, pat string) (string, error) {
 	logger := logf.FromContext(ctx)
 
 	repoDir, err := os.MkdirTemp("", "git-repo")
@@ -254,7 +243,7 @@ func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoURL, release, 
 		URL:           repoURL,
 		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/tags/%s", release)),
 		SingleBranch:  true,
-		Auth:          &http.BasicAuth{Username: config.GitHubUsername, Password: pat},
+		Auth:          &githttp.BasicAuth{Username: config.GitHubUsername, Password: pat},
 	})
 	if err != nil {
 		os.RemoveAll(repoDir)
@@ -263,6 +252,9 @@ func (r *DeploymentReconciler) cloneRepo(ctx context.Context, repoURL, release, 
 
 	return repoDir, nil
 }
+
+// removeAll is a thin wrapper around os.RemoveAll, extracted for testability.
+var removeAll = os.RemoveAll
 
 // ============================================================================
 // Ansible / Job
@@ -274,11 +266,11 @@ func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deploy
 
 	foundJob := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: deployment.Namespace}, foundJob)
-	if err != nil && !errors.IsNotFound(err) {
+	if err != nil && !k8serrors.IsNotFound(err) {
 		return nil, err
 	}
 
-	if errors.IsNotFound(err) {
+	if k8serrors.IsNotFound(err) {
 		logger.Info("Creating new Ansible Job", "Job.Name", jobName)
 		job, err := r.newAnsibleJob(deployment, jobName, gitRepoURL)
 		if err != nil {
@@ -297,7 +289,6 @@ func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deploy
 		return job, nil
 	}
 
-	// Job exists — check its terminal conditions.
 	for _, condition := range foundJob.Status.Conditions {
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
 			logger.Info("Ansible Job succeeded", "Job.Name", foundJob.Name)
@@ -348,7 +339,6 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 		Env:             []corev1.EnvVar{patEnvVar},
 	}
 
-	// Build the ansible-playbook command, optionally prepending galaxy setup.
 	playbookArgs := []string{mountPath + "/" + deployment.Spec.Ansible.AnsiblePlaybook}
 	if deployment.Spec.Parameters != "" {
 		playbookArgs = append(playbookArgs, "-e", "@"+mountPath+"/"+deployment.Spec.Parameters)
@@ -411,7 +401,6 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, deployment *techzonev1alpha1.Deployment, repoDir string) (*tektonv1.PipelineRun, error) {
 	logger := logf.FromContext(ctx)
 
-	// If we already launched a PipelineRun, just track it.
 	if deployment.Status.PipelineRunName != "" {
 		existing := &tektonv1.PipelineRun{}
 		if err := r.Get(ctx, types.NamespacedName{Name: deployment.Status.PipelineRunName, Namespace: deployment.Namespace}, existing); err != nil {
@@ -453,14 +442,14 @@ func (r *DeploymentReconciler) reconcileTektonResources(ctx context.Context, dep
 	if err := controllerutil.SetControllerReference(deployment, &pipeline, r.Scheme); err != nil {
 		return nil, err
 	}
-	if err := r.Create(ctx, &pipeline); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, &pipeline); err != nil && !k8serrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("failed to create Pipeline: %w", err)
 	}
 
 	if err := controllerutil.SetControllerReference(deployment, &pipelineRun, r.Scheme); err != nil {
 		return nil, err
 	}
-	if err := r.Create(ctx, &pipelineRun); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, &pipelineRun); err != nil && !k8serrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("failed to create PipelineRun: %w", err)
 	}
 
@@ -542,28 +531,125 @@ func (r *DeploymentReconciler) updateJobStatus(ctx context.Context, deployment *
 	return nil
 }
 
-// applyCondition translates a knative Condition into a Deployment phase and persists it.
+// applyCondition translates a knative Condition into a Deployment phase,
+// sets the standard Kubernetes status conditions, and persists the status.
 func (r *DeploymentReconciler) applyCondition(ctx context.Context, deployment *techzonev1alpha1.Deployment, cond *apis.Condition) error {
 	if cond == nil {
 		return nil
 	}
 	logger := logf.FromContext(ctx)
+
 	switch cond.Status {
 	case corev1.ConditionTrue:
 		deployment.Status.Phase = "Succeeded"
 		deployment.Status.Message = "Resource completed successfully."
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Succeeded",
+			Message:            "Deployment completed successfully.",
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Succeeded",
+			Message:            "Deployment is no longer progressing.",
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionDegraded,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Succeeded",
+			Message:            "Deployment is not degraded.",
+			ObservedGeneration: deployment.Generation,
+		})
 	case corev1.ConditionFalse:
 		deployment.Status.Phase = "Failed"
 		deployment.Status.Message = cond.Message
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Failed",
+			Message:            cond.Message,
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Failed",
+			Message:            "Deployment is no longer progressing.",
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionDegraded,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Failed",
+			Message:            cond.Message,
+			ObservedGeneration: deployment.Generation,
+		})
 	case corev1.ConditionUnknown:
 		deployment.Status.Phase = "Running"
 		deployment.Status.Message = cond.Message
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Progressing",
+			Message:            "Deployment is in progress.",
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Progressing",
+			Message:            cond.Message,
+			ObservedGeneration: deployment.Generation,
+		})
+		apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+			Type:               ConditionDegraded,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Progressing",
+			Message:            "Deployment is not degraded.",
+			ObservedGeneration: deployment.Generation,
+		})
 	}
+
 	if err := r.Status().Update(ctx, deployment); err != nil {
 		logger.Error(err, "Failed to update Deployment status")
 		return err
 	}
 	return nil
+}
+
+// setFailedStatus marks the deployment as Failed with full conditions and persists it.
+func (r *DeploymentReconciler) setFailedStatus(ctx context.Context, deployment *techzonev1alpha1.Deployment, message string) {
+	logger := logf.FromContext(ctx)
+	deployment.Status.Phase = "Failed"
+	deployment.Status.Message = message
+	apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+		Type:               ConditionReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Failed",
+		Message:            message,
+		ObservedGeneration: deployment.Generation,
+	})
+	apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+		Type:               ConditionProgressing,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Failed",
+		Message:            "Deployment is no longer progressing.",
+		ObservedGeneration: deployment.Generation,
+	})
+	apimeta.SetStatusCondition(&deployment.Status.Conditions, metav1.Condition{
+		Type:               ConditionDegraded,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Failed",
+		Message:            message,
+		ObservedGeneration: deployment.Generation,
+	})
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		logger.Error(err, "Failed to update Deployment status")
+	}
 }
 
 // ============================================================================
@@ -573,7 +659,7 @@ func (r *DeploymentReconciler) applyCondition(ctx context.Context, deployment *t
 func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context, deployment *techzonev1alpha1.Deployment) error {
 	logger := logf.FromContext(ctx)
 
-	externalURL, err := r.GetExternalClusterBaseURL(ctx)
+	externalURL, err := r.Resolver.GetExternalClusterBaseURL(ctx)
 	if err != nil {
 		return err
 	}
@@ -583,7 +669,7 @@ func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context,
 
 	existing := &console.ConsoleNotification{}
 	err = r.Get(ctx, client.ObjectKey{Name: name}, existing)
-	if errors.IsNotFound(err) {
+	if k8serrors.IsNotFound(err) {
 		logger.Info("Creating ConsoleNotification", "Name", name)
 		return r.Create(ctx, desired)
 	}
@@ -595,7 +681,7 @@ func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context,
 		logger.Info("Updating ConsoleNotification", "Name", name)
 		existing.Spec = desired.Spec
 		if err := r.Update(ctx, existing); err != nil {
-			if errors.IsConflict(err) {
+			if k8serrors.IsConflict(err) {
 				return fmt.Errorf("conflict updating ConsoleNotification, requeueing: %w", err)
 			}
 			return err
@@ -648,27 +734,15 @@ func (r *DeploymentReconciler) deleteConsoleNotification(ctx context.Context, de
 	name := fmt.Sprintf("%s-status-banner", deployment.Name)
 	notification := &console.ConsoleNotification{}
 	if err := r.Get(ctx, client.ObjectKey{Name: name}, notification); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to get ConsoleNotification %s: %w", name, err)
 	}
-	if err := r.Delete(ctx, notification); err != nil && !errors.IsNotFound(err) {
+	if err := r.Delete(ctx, notification); err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete ConsoleNotification %s: %w", name, err)
 	}
 	return nil
-}
-
-// GetExternalClusterBaseURL fetches the public host of the OpenShift Console route.
-func (r *DeploymentReconciler) GetExternalClusterBaseURL(ctx context.Context) (string, error) {
-	consoleRoute := &routev1.Route{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: "openshift-console", Name: "console"}, consoleRoute); err != nil {
-		return "", fmt.Errorf("failed to get OpenShift console Route: %w", err)
-	}
-	if consoleRoute.Spec.Host == "" {
-		return "", fmt.Errorf("console route spec.host is empty")
-	}
-	return fmt.Sprintf("https://%s", consoleRoute.Spec.Host), nil
 }
 
 // ============================================================================
@@ -676,6 +750,20 @@ func (r *DeploymentReconciler) GetExternalClusterBaseURL(ctx context.Context) (s
 // ============================================================================
 
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Wire production implementations if not already injected (e.g. by tests).
+	if r.Loader == nil {
+		r.Loader = realConfigLoader{}
+	}
+	if r.Creds == nil {
+		r.Creds = realCredentialProvider{}
+	}
+	if r.Cloner == nil {
+		r.Cloner = realRepoCloner{}
+	}
+	if r.Resolver == nil {
+		r.Resolver = realRouteResolver{c: mgr.GetClient()}
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&techzonev1alpha1.Deployment{}).
 		Named("deployment").
