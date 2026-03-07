@@ -11,10 +11,28 @@ spec:
     kind: Deployment
     listKind: DeploymentList
     plural: deployments
-    singular: deployment
+    shortNames:
+    - deployer
+    singular: deployer
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.repoName
+      name: Repo
+      type: string
+    - jsonPath: .spec.release
+      name: Release
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Deployment is the Schema for the deployments API.
