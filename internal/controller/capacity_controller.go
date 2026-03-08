@@ -60,7 +60,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: capacityPollInterval}, nil // don't propagate — keep polling
 	}
 
-	logger.Info("Cluster utilization snapshot",
+	logger.V(1).Info("Cluster utilization snapshot",
 		"cpu_ratio", fmt.Sprintf("%.1f%%", cpuRatio*100),
 		"memory_ratio", fmt.Sprintf("%.1f%%", memRatio*100),
 	)
@@ -78,7 +78,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 
 	updated := false
 	if cpuRatio > peak.CPURatio {
-		logger.Info("New CPU peak recorded",
+		logger.V(1).Info("New CPU peak recorded",
 			"previous", fmt.Sprintf("%.1f%%", peak.CPURatio*100),
 			"new", fmt.Sprintf("%.1f%%", cpuRatio*100),
 		)
@@ -86,7 +86,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		updated = true
 	}
 	if memRatio > peak.MemoryRatio {
-		logger.Info("New memory peak recorded",
+		logger.V(1).Info("New memory peak recorded",
 			"previous", fmt.Sprintf("%.1f%%", peak.MemoryRatio*100),
 			"new", fmt.Sprintf("%.1f%%", memRatio*100),
 		)
@@ -137,8 +137,13 @@ func (r *CapacityReconciler) computeUtilization(ctx context.Context) (cpuRatio, 
 	}
 
 	// --- Pod requests ---
+	// Filter to Running pods at the API server level to avoid fetching
+	// completed, pending, or failed pods — reducing response size significantly
+	// on clusters with high pod churn.
 	podList := &corev1.PodList{}
-	if err := r.APIReader.List(ctx, podList); err != nil {
+	if err := r.APIReader.List(ctx, podList,
+		client.MatchingFields{"status.phase": string(corev1.PodRunning)},
+	); err != nil {
 		return 0, 0, fmt.Errorf("failed to list pods via APIReader: %w", err)
 	}
 
@@ -280,5 +285,6 @@ func (r *CapacityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&appsv1.Deployment{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetName() == "itz-deployer-operator-controller-manager" && obj.GetNamespace() == r.Namespace
 		}))).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

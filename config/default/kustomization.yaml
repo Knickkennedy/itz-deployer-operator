@@ -1,5 +1,5 @@
 # Adds namespace to all resources.
-namespace: itz-deployer-operator-system
+namespace: openshift-operators
 
 # Value of this field is prepended to the
 # names of all resources, e.g. a deployment named
@@ -20,7 +20,7 @@ resources:
   - ../manager
   # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
   # crd/kustomization.yaml
-  #- ../webhook
+  - ../webhook
   # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
   #- ../certmanager
   # [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
@@ -37,25 +37,22 @@ resources:
 patches:
   # [METRICS] The following patch will enable the metrics endpoint using HTTPS and the port :8443.
   # More info: https://book.kubebuilder.io/reference/metrics
-  - path: manager_metrics_patch.yaml
-    target:
+  - target:
       kind: Deployment
-# Uncomment the patches line if you enable Metrics and CertManager
-# [METRICS-WITH-CERTS] To enable metrics protected with certManager, uncomment the following line.
-# This patch will protect the metrics with certManager self-signed certs.
-#- path: cert_metrics_manager_patch.yaml
-#  target:
-#    kind: Deployment
-
-# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
-# crd/kustomization.yaml
-#- path: manager_webhook_patch.yaml
-#  target:
-#    kind: Deployment
+      name: controller-manager
+    path: manager_metrics_patch.yaml
+  - target:
+      kind: Deployment
+      name: controller-manager
+    path: cert_metrics_manager_patch.yaml
+  - target:
+      kind: Deployment
+      name: controller-manager
+    path: manager_webhook_patch.yaml
 
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
 # Uncomment the following replacements to add the cert-manager CA injection annotations
-#replacements:
+# replacements:
 # - source: # Uncomment the following block to enable certificates for metrics
 #     kind: Service
 #     version: v1
@@ -165,7 +162,7 @@ patches:
 #       fieldPaths:
 #         - .metadata.annotations.[cert-manager.io/inject-ca-from]
 #       options:
-#         delimiter: '/'
+#         delimiter: "/"
 #         index: 0
 #         create: true
 # - source:
@@ -180,7 +177,7 @@ patches:
 #       fieldPaths:
 #         - .metadata.annotations.[cert-manager.io/inject-ca-from]
 #       options:
-#         delimiter: '/'
+#         delimiter: "/"
 #         index: 1
 #         create: true
 #
