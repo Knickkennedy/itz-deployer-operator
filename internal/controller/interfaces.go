@@ -2,13 +2,18 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"os"
 
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	routev1 "github.com/openshift/api/route/v1"
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
+	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	ibm "github.ibm.com/itz-content/itz-deployer-operator/pkg/ibm"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ConfigLoader abstracts loading OperatorConfig so tests can inject a fake
@@ -62,17 +67,34 @@ func (realCredentialProvider) GetGitHubPAT(ctx context.Context, cfg config.Opera
 	return ibm.GetGitHubPAT(smClient, cfg.SecretsManagerSecretID)
 }
 
+// errEmptyRouteHost is returned when the OpenShift console Route has no host.
+var errEmptyRouteHost = fmt.Errorf("console route spec.host is empty")
+
 // realRepoCloner clones via go-git.
 type realRepoCloner struct{}
 
 func (realRepoCloner) Clone(ctx context.Context, repoURL, release, pat string) (string, func(), error) {
-	dir, err := cloneRepoImpl(ctx, repoURL, release, pat)
+	logger := logf.FromContext(ctx)
+
+	dir, err := os.MkdirTemp("", "git-repo")
 	if err != nil {
-		return "", func() {}, err
+		return "", func() {}, fmt.Errorf("failed to create temp directory: %w", err)
 	}
-	return dir, func() {
-		_ = removeAll(dir)
-	}, nil
+
+	logger.Info("Cloning repository", "URL", repoURL, "tag", release)
+
+	_, err = git.PlainClone(dir, false, &git.CloneOptions{
+		URL:           repoURL,
+		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/tags/%s", release)),
+		SingleBranch:  true,
+		Auth:          &githttp.BasicAuth{Username: config.GitHubUsername, Password: pat},
+	})
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", func() {}, fmt.Errorf("failed to clone %s at tag %s: %w", repoURL, release, err)
+	}
+
+	return dir, func() { os.RemoveAll(dir) }, nil
 }
 
 // realRouteResolver fetches the console Route from the cluster.
@@ -92,4 +114,28 @@ func (r realRouteResolver) GetExternalClusterBaseURL(ctx context.Context) (strin
 		return "", errEmptyRouteHost
 	}
 	return "https://" + consoleRoute.Spec.Host, nil
+}
+
+// ============================================================================
+// Exported constructors for use in main.go
+// ============================================================================
+
+// NewRealConfigLoader returns the production ConfigLoader.
+func NewRealConfigLoader() ConfigLoader {
+	return realConfigLoader{}
+}
+
+// NewRealCredentialProvider returns the production CredentialProvider.
+func NewRealCredentialProvider() CredentialProvider {
+	return realCredentialProvider{}
+}
+
+// NewRealRepoCloner returns the production RepoCloner.
+func NewRealRepoCloner() RepoCloner {
+	return realRepoCloner{}
+}
+
+// NewRealRouteResolver returns the production RouteResolver.
+func NewRealRouteResolver(c client.Client) RouteResolver {
+	return realRouteResolver{c: c}
 }

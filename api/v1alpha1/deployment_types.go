@@ -39,10 +39,6 @@ type Deployment struct {
 
 // DeploymentSpec defines the desired state of Deployment.
 type DeploymentSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// Foo is an example field of Deployment. Edit deployment_types.go to remove/update
 	RepoName       string         `json:"repoName"`
 	Release        string         `json:"release"`
 	Parameters     string         `json:"parameters,omitempty"`
@@ -50,14 +46,93 @@ type DeploymentSpec struct {
 	PostDeployment PostDeployment `json:"postDeployment,omitempty"`
 }
 
+// FailureCategory is a machine-readable classification of why a deployment
+// failed. Intended for consumption by AI agents and automation.
+// +kubebuilder:validation:Enum=CredentialError;CloneError;StepFailed;JobFailed;ConfigError;Unknown
+type FailureCategory string
+
+const (
+	// FailureCategoryCredential indicates an authentication or authorisation
+	// failure — e.g. IBM Secrets Manager unreachable, bad GitHub PAT.
+	FailureCategoryCredential FailureCategory = "CredentialError"
+
+	// FailureCategoryClone indicates the git clone failed — bad tag, repo not
+	// found, or network error reaching GitHub Enterprise.
+	FailureCategoryClone FailureCategory = "CloneError"
+
+	// FailureCategoryStepFailed indicates a Tekton TaskRun step exited non-zero.
+	FailureCategoryStepFailed FailureCategory = "StepFailed"
+
+	// FailureCategoryJobFailed indicates a Kubernetes Job (Ansible runner) failed.
+	FailureCategoryJobFailed FailureCategory = "JobFailed"
+
+	// FailureCategoryConfig indicates a misconfiguration detectable at runtime
+	// — e.g. missing pipeline.yaml in the repo, bad parameters file.
+	FailureCategoryConfig FailureCategory = "ConfigError"
+
+	// FailureCategoryUnknown is used when the failure cannot be categorised.
+	FailureCategoryUnknown FailureCategory = "Unknown"
+)
+
+// DiagnosticEntry captures structured failure information from a single
+// component (a Tekton step, an Ansible job container, etc.).
+// Designed to give an AI agent enough context to diagnose and remediate
+// without needing to query additional Kubernetes resources.
+type DiagnosticEntry struct {
+	// Component identifies which part of the system produced this entry.
+	// e.g. "Tekton", "AnsibleJob", "Operator"
+	Component string `json:"component"`
+
+	// TaskName is the Tekton Task name that failed, if applicable.
+	// +optional
+	TaskName string `json:"taskName,omitempty"`
+
+	// StepName is the Tekton step name that failed, if applicable.
+	// +optional
+	StepName string `json:"stepName,omitempty"`
+
+	// ExitCode is the process exit code from the failed container, if available.
+	// +optional
+	ExitCode *int32 `json:"exitCode,omitempty"`
+
+	// Reason is the short machine-readable reason string from the container
+	// status or condition, e.g. "Error", "OOMKilled", "DeadlineExceeded".
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message is the human-readable failure message from the Kubernetes object.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// LogTail contains the last N lines of the failed container's log.
+	// Populated at failure time so an AI agent does not need to query pod logs
+	// separately — the pod may be gone by the time the agent acts.
+	// +optional
+	LogTail string `json:"logTail,omitempty"`
+
+	// RemediationHint is a structured suggestion for fixing this failure.
+	// Written by the operator based on the failure category and component.
+	// +optional
+	RemediationHint string `json:"remediationHint,omitempty"`
+}
+
 // DeploymentStatus defines the observed state of Deployment.
 type DeploymentStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
 	Conditions      []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 	Phase           string             `json:"phase,omitempty"`
 	Message         string             `json:"message,omitempty"`
 	PipelineRunName string             `json:"pipelineRunName,omitempty"`
+
+	// FailureCategory is a machine-readable classification of the failure.
+	// Only populated when Phase is "Failed".
+	// +optional
+	FailureCategory FailureCategory `json:"failureCategory,omitempty"`
+
+	// Diagnostics contains structured failure information collected at the time
+	// of failure. Each entry corresponds to a failed component (Tekton step,
+	// Ansible container, etc.). Populated only when Phase is "Failed".
+	// +optional
+	Diagnostics []DiagnosticEntry `json:"diagnostics,omitempty"`
 }
 
 type Ansible struct {

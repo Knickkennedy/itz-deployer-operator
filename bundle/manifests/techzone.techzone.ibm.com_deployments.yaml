@@ -88,8 +88,6 @@ spec:
               release:
                 type: string
               repoName:
-                description: Foo is an example field of Deployment. Edit deployment_types.go
-                  to remove/update
                 type: string
             required:
             - release
@@ -99,9 +97,6 @@ spec:
             description: DeploymentStatus defines the observed state of Deployment.
             properties:
               conditions:
-                description: |-
-                  INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-                  Important: Run "make" to regenerate code after modifying this file
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -157,6 +152,72 @@ spec:
                   - type
                   type: object
                 type: array
+              diagnostics:
+                description: |-
+                  Diagnostics contains structured failure information collected at the time
+                  of failure. Each entry corresponds to a failed component (Tekton step,
+                  Ansible container, etc.). Populated only when Phase is "Failed".
+                items:
+                  description: |-
+                    DiagnosticEntry captures structured failure information from a single
+                    component (a Tekton step, an Ansible job container, etc.).
+                    Designed to give an AI agent enough context to diagnose and remediate
+                    without needing to query additional Kubernetes resources.
+                  properties:
+                    component:
+                      description: |-
+                        Component identifies which part of the system produced this entry.
+                        e.g. "Tekton", "AnsibleJob", "Operator"
+                      type: string
+                    exitCode:
+                      description: ExitCode is the process exit code from the failed
+                        container, if available.
+                      format: int32
+                      type: integer
+                    logTail:
+                      description: |-
+                        LogTail contains the last N lines of the failed container's log.
+                        Populated at failure time so an AI agent does not need to query pod logs
+                        separately — the pod may be gone by the time the agent acts.
+                      type: string
+                    message:
+                      description: Message is the human-readable failure message from
+                        the Kubernetes object.
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is the short machine-readable reason string from the container
+                        status or condition, e.g. "Error", "OOMKilled", "DeadlineExceeded".
+                      type: string
+                    remediationHint:
+                      description: |-
+                        RemediationHint is a structured suggestion for fixing this failure.
+                        Written by the operator based on the failure category and component.
+                      type: string
+                    stepName:
+                      description: StepName is the Tekton step name that failed, if
+                        applicable.
+                      type: string
+                    taskName:
+                      description: TaskName is the Tekton Task name that failed, if
+                        applicable.
+                      type: string
+                  required:
+                  - component
+                  type: object
+                type: array
+              failureCategory:
+                description: |-
+                  FailureCategory is a machine-readable classification of the failure.
+                  Only populated when Phase is "Failed".
+                enum:
+                - CredentialError
+                - CloneError
+                - StepFailed
+                - JobFailed
+                - ConfigError
+                - Unknown
+                type: string
               message:
                 type: string
               phase:

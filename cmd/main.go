@@ -191,9 +191,13 @@ func main() {
 	}
 
 	if err := (&controller.DeploymentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Config: mgr.GetConfig(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Config:   mgr.GetConfig(),
+		Loader:   controller.NewRealConfigLoader(),
+		Creds:    controller.NewRealCredentialProvider(),
+		Cloner:   controller.NewRealRepoCloner(),
+		Resolver: controller.NewRealRouteResolver(mgr.GetClient()),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")
 		os.Exit(1)

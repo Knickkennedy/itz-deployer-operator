@@ -40,24 +40,22 @@ type CapacityPeak struct {
 // resource utilization high watermark.
 type CapacityReconciler struct {
 	client.Client
-	APIReader client.Reader // <--- Add this to bypass the cache
+	APIReader client.Reader
 	Scheme    *runtime.Scheme
-	Namespace string // operator namespace, set at startup
+	Namespace string
 }
 
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update;patch
 
-// Reconcile is triggered on a schedule via SetupWithManager. It has no
-// watched resource — req will always be empty.
 func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithName("CapacityReconciler")
 
 	cpuRatio, memRatio, err := r.computeUtilization(ctx)
 	if err != nil {
 		logger.Error(err, "Failed to compute cluster utilization")
-		return ctrl.Result{RequeueAfter: capacityPollInterval}, nil // don't propagate — keep polling
+		return ctrl.Result{RequeueAfter: capacityPollInterval}, nil
 	}
 
 	logger.V(1).Info("Cluster utilization snapshot",
@@ -65,11 +63,9 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		"memory_ratio", fmt.Sprintf("%.1f%%", memRatio*100),
 	)
 
-	// Always publish current ratios to Prometheus.
 	itzmetrics.CurrentRequestedCPURatio.Set(cpuRatio)
 	itzmetrics.CurrentRequestedMemoryRatio.Set(memRatio)
 
-	// Load the stored peak, update if we've exceeded it, persist.
 	peak, err := r.loadPeak(ctx)
 	if err != nil {
 		logger.Error(err, "Failed to load capacity peak ConfigMap")
@@ -101,26 +97,28 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		}
 	}
 
-	// Publish peak gauges whether or not they changed, so Prometheus always
-	// has a current value after an operator restart.
 	itzmetrics.PeakRequestedCPURatio.Set(peak.CPURatio)
 	itzmetrics.PeakRequestedMemoryRatio.Set(peak.MemoryRatio)
 
 	return ctrl.Result{RequeueAfter: capacityPollInterval}, nil
 }
 
-// computeUtilization sums CPU and memory requests across all Running pods
-// and divides by total allocatable capacity across all worker nodes.
+// computeUtilization calculates cluster-wide resource request ratios.
+//
+// Effective pod request follows the Kubernetes scheduler formula:
+//
+//	effective = max(sum(container requests), max(init container requests))
+//
+// This matches what the scheduler actually reserves when placing pods.
 func (r *CapacityReconciler) computeUtilization(ctx context.Context) (cpuRatio, memRatio float64, err error) {
 	// --- Node allocatable capacity ---
 	nodeList := &corev1.NodeList{}
 	if err := r.APIReader.List(ctx, nodeList); err != nil {
-		return 0, 0, fmt.Errorf("failed to list nodes via APIReader: %w", err)
+		return 0, 0, fmt.Errorf("failed to list nodes: %w", err)
 	}
 
 	var totalCPU, totalMemory resource.Quantity
 	for _, node := range nodeList.Items {
-		// Skip master/control-plane nodes — we only care about worker capacity.
 		if isMasterNode(node) {
 			continue
 		}
@@ -133,48 +131,82 @@ func (r *CapacityReconciler) computeUtilization(ctx context.Context) (cpuRatio, 
 	}
 
 	if totalCPU.IsZero() || totalMemory.IsZero() {
-		return 0, 0, fmt.Errorf("no worker node capacity found — no worker nodes available")
+		return 0, 0, fmt.Errorf("no worker node capacity found")
 	}
 
 	// --- Pod requests ---
-	// Filter to Running pods at the API server level to avoid fetching
-	// completed, pending, or failed pods — reducing response size significantly
-	// on clusters with high pod churn.
+	// NOTE: status.phase is NOT a supported server-side field selector in most
+	// Kubernetes versions — it is evaluated client-side only. We fetch all pods
+	// and filter manually to avoid silent full-list fallback behaviour, but we
+	// limit memory pressure by only retaining the fields we need (requests) and
+	// discarding the rest immediately in the loop.
 	podList := &corev1.PodList{}
-	if err := r.APIReader.List(ctx, podList,
-		client.MatchingFields{"status.phase": string(corev1.PodRunning)},
-	); err != nil {
-		return 0, 0, fmt.Errorf("failed to list pods via APIReader: %w", err)
+	if err := r.APIReader.List(ctx, podList); err != nil {
+		return 0, 0, fmt.Errorf("failed to list pods: %w", err)
 	}
 
 	var requestedCPU, requestedMemory resource.Quantity
-	for _, pod := range podList.Items {
+	for i := range podList.Items {
+		pod := &podList.Items[i]
 		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		for _, container := range pod.Spec.Containers {
-			if cpu := container.Resources.Requests.Cpu(); cpu != nil {
-				requestedCPU.Add(*cpu)
-			}
-			if mem := container.Resources.Requests.Memory(); mem != nil {
-				requestedMemory.Add(*mem)
-			}
-		}
-		// Include init containers that are still running.
-		for _, init := range pod.Spec.InitContainers {
-			if cpu := init.Resources.Requests.Cpu(); cpu != nil {
-				requestedCPU.Add(*cpu)
-			}
-			if mem := init.Resources.Requests.Memory(); mem != nil {
-				requestedMemory.Add(*mem)
-			}
-		}
+
+		podCPU, podMem := effectivePodRequests(pod)
+		requestedCPU.Add(podCPU)
+		requestedMemory.Add(podMem)
+
+		// Nil out the pod spec immediately after processing to allow GC to
+		// reclaim memory before the next iteration on large clusters.
+		pod.Spec = corev1.PodSpec{}
+		pod.Status = corev1.PodStatus{}
 	}
 
 	cpuRatio = float64(requestedCPU.MilliValue()) / float64(totalCPU.MilliValue())
 	memRatio = float64(requestedMemory.Value()) / float64(totalMemory.Value())
 
 	return cpuRatio, memRatio, nil
+}
+
+// effectivePodRequests returns the effective CPU and memory requests for a pod
+// using the Kubernetes scheduler formula:
+//
+//	effective = max(sum(container requests), max(init container requests))
+func effectivePodRequests(pod *corev1.Pod) (cpu, memory resource.Quantity) {
+	// Sum all regular container requests.
+	var containerCPU, containerMemory resource.Quantity
+	for _, c := range pod.Spec.Containers {
+		if v := c.Resources.Requests.Cpu(); v != nil {
+			containerCPU.Add(*v)
+		}
+		if v := c.Resources.Requests.Memory(); v != nil {
+			containerMemory.Add(*v)
+		}
+	}
+
+	// Find the maximum single init container request.
+	var maxInitCPU, maxInitMemory resource.Quantity
+	for _, c := range pod.Spec.InitContainers {
+		if v := c.Resources.Requests.Cpu(); v != nil && v.Cmp(maxInitCPU) > 0 {
+			maxInitCPU = v.DeepCopy()
+		}
+		if v := c.Resources.Requests.Memory(); v != nil && v.Cmp(maxInitMemory) > 0 {
+			maxInitMemory = v.DeepCopy()
+		}
+	}
+
+	// effective = max(containers, max(init containers))
+	if maxInitCPU.Cmp(containerCPU) > 0 {
+		cpu = maxInitCPU
+	} else {
+		cpu = containerCPU
+	}
+	if maxInitMemory.Cmp(containerMemory) > 0 {
+		memory = maxInitMemory
+	} else {
+		memory = containerMemory
+	}
+	return cpu, memory
 }
 
 // isMasterNode returns true if the node carries any control-plane taint or label.
@@ -262,7 +294,6 @@ func (r *CapacityReconciler) savePeak(ctx context.Context, peak CapacityPeak) er
 
 // OperatorNamespace returns the namespace the operator is running in,
 // read from the serviceaccount file injected by Kubernetes.
-// Exported so main.go can use it during controller setup.
 func OperatorNamespace() (string, error) {
 	data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 	if err != nil {
@@ -271,20 +302,17 @@ func OperatorNamespace() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// SetupWithManager registers the CapacityReconciler. This controller is
-// purely schedule-driven — Reconcile always returns RequeueAfter so it
-// runs every capacityPollInterval without needing a watched resource.
-// We trigger the first reconcile by watching our own peak ConfigMap;
-// if it doesn't exist yet the first poll creates it and subsequent events
-// keep the loop alive via RequeueAfter.
+// SetupWithManager registers the CapacityReconciler. The controller watches
+// the operator's own Deployment to trigger the first reconcile at startup.
+// Subsequent runs are driven purely by the RequeueAfter in Reconcile.
+// GenerationChangedPredicate is intentionally NOT used — we want the initial
+// cache sync event (generation unchanged) to fire so the loop starts.
 func (r *CapacityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("capacity").
-		// Watch the Deployment of the operator itself.
-		// Since the operator IS running, this event happens exactly once at startup.
 		For(&appsv1.Deployment{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetName() == "itz-deployer-operator-controller-manager" && obj.GetNamespace() == r.Namespace
+			return obj.GetName() == "itz-deployer-operator-controller-manager" &&
+				obj.GetNamespace() == r.Namespace
 		}))).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }
