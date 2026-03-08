@@ -212,18 +212,20 @@ var _ = Describe("Deployment Controller", func() {
 			}
 		})
 
-		It("sets Ready=True, Progressing=False, Degraded=False", func() {
+		It("sets Ready=True, Progressing=False, Degraded=False and clears diagnostics", func() {
 			r := newTestReconciler(k8sClient)
 
 			dep := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep)).To(Succeed())
 
-			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionTrue, "done"))).To(Succeed())
+			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionTrue, "done"), nil, nil)).To(Succeed())
 
 			updated := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, updated)).To(Succeed())
 
 			Expect(updated.Status.Phase).To(Equal("Succeeded"))
+			Expect(updated.Status.Diagnostics).To(BeNil())
+			Expect(updated.Status.FailureCategory).To(BeEmpty())
 
 			Expect(getCondition(updated, ConditionReady)).To(And(
 				Not(BeNil()),
@@ -269,7 +271,8 @@ var _ = Describe("Deployment Controller", func() {
 			dep := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep)).To(Succeed())
 
-			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionFalse, failureMsg))).To(Succeed())
+			// Pass nil PipelineRun and Job — no real resources to walk in unit tests.
+			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionFalse, failureMsg), nil, nil)).To(Succeed())
 
 			updated := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, updated)).To(Succeed())
@@ -321,7 +324,7 @@ var _ = Describe("Deployment Controller", func() {
 			dep := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep)).To(Succeed())
 
-			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionUnknown, "Running pipeline steps."))).To(Succeed())
+			Expect(r.applyCondition(ctx, dep, makeKnativeCond(corev1.ConditionUnknown, "Running pipeline steps."), nil, nil)).To(Succeed())
 
 			updated := &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, updated)).To(Succeed())
@@ -358,12 +361,10 @@ var _ = Describe("Deployment Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, dep)).To(Succeed())
 
-			// First reconcile registers the finalizer.
 			r := newTestReconciler(k8sClient)
 			_, err := reconcileDeployment(ctx, r, name, namespace)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Create the ConsoleNotification that the finalizer is responsible for cleaning up.
 			notification := &console.ConsoleNotification{
 				ObjectMeta: metav1.ObjectMeta{Name: notifName},
 				Spec: console.ConsoleNotificationSpec{
@@ -384,12 +385,10 @@ var _ = Describe("Deployment Controller", func() {
 			_, err := reconcileDeployment(ctx, r, name, namespace)
 			Expect(err).NotTo(HaveOccurred())
 
-			// ConsoleNotification must be gone.
 			notif := &console.ConsoleNotification{}
 			err = k8sClient.Get(ctx, client.ObjectKey{Name: notifName}, notif)
 			Expect(errors.IsNotFound(err)).To(BeTrue(), "ConsoleNotification should have been deleted")
 
-			// CR should be fully gone once finalizer is removed.
 			dep = &techzonev1alpha1.Deployment{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep)
 			Expect(errors.IsNotFound(err)).To(BeTrue(), "Deployment CR should be fully deleted")
@@ -419,12 +418,10 @@ var _ = Describe("Deployment Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, dep)).To(Succeed())
 
-			// Register finalizer.
 			r := newTestReconciler(k8sClient)
 			_, err := reconcileDeployment(ctx, r, name, namespace)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Simulate Succeeded phase.
 			dep = &techzonev1alpha1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep)).To(Succeed())
 			dep.Status.Phase = "Succeeded"
@@ -490,7 +487,6 @@ var _ = Describe("Deployment Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, dep)).To(Succeed())
 
-			// Register finalizer first.
 			r := newTestReconciler(k8sClient)
 			_, err := reconcileDeployment(ctx, r, name, namespace)
 			Expect(err).NotTo(HaveOccurred())
@@ -503,7 +499,7 @@ var _ = Describe("Deployment Controller", func() {
 			}
 		})
 
-		It("marks the Deployment as Failed with Degraded=True", func() {
+		It("marks the Deployment as Failed with Degraded=True, CloneError category, and a diagnostic entry", func() {
 			r := newTestReconciler(k8sClient)
 			r.Cloner = fakeRepoCloner{err: fmt.Errorf("authentication failed")}
 
@@ -515,10 +511,61 @@ var _ = Describe("Deployment Controller", func() {
 
 			Expect(updated.Status.Phase).To(Equal("Failed"))
 			Expect(updated.Status.Message).To(ContainSubstring("authentication failed"))
+			Expect(updated.Status.FailureCategory).To(Equal(techzonev1alpha1.FailureCategoryClone))
+
+			Expect(updated.Status.Diagnostics).To(HaveLen(1))
+			Expect(updated.Status.Diagnostics[0].Component).To(Equal("Operator"))
+			Expect(updated.Status.Diagnostics[0].Message).To(ContainSubstring("authentication failed"))
+			Expect(updated.Status.Diagnostics[0].RemediationHint).NotTo(BeEmpty())
+
 			Expect(getCondition(updated, ConditionDegraded)).To(And(
 				Not(BeNil()),
 				HaveField("Status", metav1.ConditionTrue),
 			))
+		})
+	})
+
+	// -------------------------------------------------------------------------
+	// Credential failure
+	// -------------------------------------------------------------------------
+	Context("When credentials cannot be retrieved", func() {
+		const name = "test-cred-fail"
+
+		BeforeEach(func() {
+			dep := &techzonev1alpha1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec:       techzonev1alpha1.DeploymentSpec{RepoName: "some-repo", Release: "v1.0.0"},
+			}
+			Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+
+			r := newTestReconciler(k8sClient)
+			_, err := reconcileDeployment(ctx, r, name, namespace)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			dep := &techzonev1alpha1.Deployment{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, dep); err == nil {
+				Expect(k8sClient.Delete(ctx, dep)).To(Succeed())
+			}
+		})
+
+		It("marks the Deployment as Failed with CredentialError category and a remediation hint", func() {
+			r := newTestReconciler(k8sClient)
+			r.Creds = fakeCredentialProvider{err: fmt.Errorf("secrets manager unreachable")}
+
+			_, err := reconcileDeployment(ctx, r, name, namespace)
+			Expect(err).To(HaveOccurred())
+
+			updated := &techzonev1alpha1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, updated)).To(Succeed())
+
+			Expect(updated.Status.Phase).To(Equal("Failed"))
+			Expect(updated.Status.FailureCategory).To(Equal(techzonev1alpha1.FailureCategoryCredential))
+
+			Expect(updated.Status.Diagnostics).To(HaveLen(1))
+			Expect(updated.Status.Diagnostics[0].Component).To(Equal("Operator"))
+			Expect(updated.Status.Diagnostics[0].RemediationHint).To(ContainSubstring("SecretsManagerURL"))
 		})
 	})
 })

@@ -18,7 +18,7 @@ metadata:
         }
       ]
     capabilities: Basic Install
-    createdAt: "2026-03-08T01:04:32Z"
+    createdAt: "2026-03-08T03:12:12Z"
     operators.operatorframework.io/builder: operator-sdk-v1.41.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
   name: itz-deployer-operator.v0.0.7
@@ -117,6 +117,14 @@ spec:
           - update
           - watch
         - apiGroups:
+          - tekton.dev
+          resources:
+          - taskruns
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
           - authentication.k8s.io
           resources:
           - tokenreviews
@@ -190,11 +198,11 @@ spec:
                   timeoutSeconds: 5
                 resources:
                   limits:
-                    cpu: 500m
-                    memory: 128Mi
+                    cpu: "1"
+                    memory: 512Mi
                   requests:
-                    cpu: 10m
-                    memory: 64Mi
+                    cpu: 100m
+                    memory: 256Mi
                 securityContext:
                   allowPrivilegeEscalation: false
                   capabilities:
