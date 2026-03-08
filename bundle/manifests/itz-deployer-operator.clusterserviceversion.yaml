@@ -18,7 +18,7 @@ metadata:
         }
       ]
     capabilities: Basic Install
-    createdAt: "2026-03-07T06:12:45Z"
+    createdAt: "2026-03-08T01:04:32Z"
     operators.operatorframework.io/builder: operator-sdk-v1.41.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
   name: itz-deployer-operator.v0.0.7
@@ -164,9 +164,7 @@ spec:
             spec:
               containers:
               - args:
-                - --metrics-bind-address=:8443
-                - --leader-elect
-                - --health-probe-bind-address=:8081
+                - --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
                 command:
                 - /manager
                 image: quay.io/ibmtz/deployer-operator:v0.0.7
@@ -175,15 +173,21 @@ spec:
                   httpGet:
                     path: /healthz
                     port: 8081
-                  initialDelaySeconds: 15
+                  initialDelaySeconds: 30
                   periodSeconds: 20
+                  timeoutSeconds: 5
                 name: manager
+                ports:
+                - containerPort: 8443
+                  name: metrics
+                  protocol: TCP
                 readinessProbe:
                   httpGet:
                     path: /readyz
                     port: 8081
-                  initialDelaySeconds: 5
-                  periodSeconds: 10
+                  initialDelaySeconds: 30
+                  periodSeconds: 20
+                  timeoutSeconds: 5
                 resources:
                   limits:
                     cpu: 500m
@@ -196,12 +200,32 @@ spec:
                   capabilities:
                     drop:
                     - ALL
+                volumeMounts:
+                - mountPath: /tmp/k8s-webhook-server/serving-certs
+                  name: webhook-certs
+                  readOnly: true
+                - mountPath: /tmp/k8s-metrics-server/metrics-certs
+                  name: metrics-certs
+                  readOnly: true
               securityContext:
                 runAsNonRoot: true
                 seccompProfile:
                   type: RuntimeDefault
               serviceAccountName: itz-deployer-operator-controller-manager
               terminationGracePeriodSeconds: 10
+              volumes:
+              - name: webhook-certs
+                secret:
+                  secretName: webhook-server-cert
+              - name: metrics-certs
+                secret:
+                  items:
+                  - key: tls.crt
+                    path: tls.crt
+                  - key: tls.key
+                    path: tls.key
+                  optional: false
+                  secretName: metrics-server-cert
       permissions:
       - rules:
         - apiGroups:
@@ -275,3 +299,24 @@ spec:
   provider:
     name: IBM Technology Zone
   version: 0.0.7
+  webhookdefinitions:
+  - admissionReviewVersions:
+    - v1
+    containerPort: 443
+    deploymentName: itz-deployer-operator-controller-manager
+    failurePolicy: Fail
+    generateName: vdeployment.kb.io
+    rules:
+    - apiGroups:
+      - techzone.techzone.ibm.com
+      apiVersions:
+      - v1alpha1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - deployments
+    sideEffects: None
+    targetPort: 9443
+    type: ValidatingAdmissionWebhook
+    webhookPath: /validate-techzone-techzone-ibm-com-v1alpha1-deployment

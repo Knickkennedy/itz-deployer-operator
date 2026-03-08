@@ -1,4 +1,3 @@
-# Prometheus Monitor Service (Metrics)
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -7,21 +6,18 @@ metadata:
     app.kubernetes.io/name: itz-deployer-operator
     app.kubernetes.io/managed-by: kustomize
   name: controller-manager-metrics-monitor
-  namespace: system
+  namespace: openshift-operators
 spec:
   endpoints:
     - path: /metrics
-      port: https # Ensure this is the name of the port that exposes HTTPS metrics
+      port: https
       scheme: https
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
-        # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables
-        # certificate verification, exposing the system to potential man-in-the-middle attacks.
-        # For production environments, it is recommended to use cert-manager for automatic TLS certificate management.
-        # To apply this configuration, enable cert-manager and use the patch located at config/prometheus/servicemonitor_tls_patch.yaml,
-        # which securely references the certificate from the 'metrics-server-cert' secret.
-        insecureSkipVerify: true
+        caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
+        # UPDATE THIS to match the new shortened service name
+        serverName: itz-deployer-operator-metrics-service.openshift-operators.svc
   selector:
     matchLabels:
+      # Ensure these labels match what is in your shortened metrics_service.yaml
       control-plane: controller-manager
-      app.kubernetes.io/name: itz-deployer-operator

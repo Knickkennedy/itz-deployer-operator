@@ -199,6 +199,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&techzonev1alpha1.Deployment{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "Deployment")
+		os.Exit(1)
+	}
+
 	operatorNS, err := controller.OperatorNamespace()
 	if err != nil {
 		setupLog.Error(err, "unable to determine operator namespace")
