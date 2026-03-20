@@ -12,13 +12,35 @@ metadata:
               "app.kubernetes.io/managed-by": "kustomize",
               "app.kubernetes.io/name": "itz-deployer-operator"
             },
-            "name": "deployment-sample"
+            "name": "deployer-cp4d-ansible"
           },
-          "spec": null
+          "spec": {
+            "ansible": {
+              "ansiblePlaybook": "site.yml"
+            },
+            "release": "base-5.3.0-ansible",
+            "repoName": "deployer-cp4d"
+          }
+        },
+        {
+          "apiVersion": "techzone.techzone.ibm.com/v1alpha1",
+          "kind": "Deployment",
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "kustomize",
+              "app.kubernetes.io/name": "itz-deployer-operator"
+            },
+            "name": "deployer-cp4d-tekton"
+          },
+          "spec": {
+            "parameters": "base-cpd.yaml",
+            "release": "base-5.3.0",
+            "repoName": "deployer-cp4d"
+          }
         }
       ]
     capabilities: Basic Install
-    createdAt: "2026-03-08T03:12:12Z"
+    createdAt: "2026-03-20T01:17:41Z"
     operators.operatorframework.io/builder: operator-sdk-v1.41.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
   name: itz-deployer-operator.v0.0.7

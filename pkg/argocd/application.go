@@ -14,21 +14,21 @@ import (
 	client "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func argoApplication(client client.Client) error {
-	isDeployed, _ := getApplication(client)
+func argoApplication(ctx context.Context, client client.Client, cfg config.OperatorConfig) error {
+	isDeployed, _ := getApplication(ctx, client)
 	if !isDeployed {
-		if err := createApplication(client); err != nil {
+		if err := createApplication(ctx, client, cfg); err != nil {
 			return err
 		}
 	}
-	return waitForTasks(client)
+	return waitForTasks(ctx, client, cfg)
 }
 
-func getApplication(kclient client.Client) (bool, error) {
+func getApplication(ctx context.Context, kclient client.Client) (bool, error) {
 	u := &unstructured.Unstructured{}
 	u.SetAPIVersion("argoproj.io/v1alpha1")
 	u.SetKind("Application")
-	err := kclient.Get(context.Background(), client.ObjectKey{
+	err := kclient.Get(ctx, client.ObjectKey{
 		Namespace: config.ArgoCDNamespace,
 		Name:      config.ArgoCDApplicationName,
 	}, u)
@@ -42,8 +42,8 @@ func getApplication(kclient client.Client) (bool, error) {
 	return isFound, nil
 }
 
-func createApplication(kclient client.Client) error {
-	if err := rbac.CreateArgoCDRBAC(kclient); err != nil {
+func createApplication(ctx context.Context, kclient client.Client, cfg config.OperatorConfig) error {
+	if err := rbac.CreateArgoCDRBAC(ctx, kclient); err != nil {
 		return err
 	}
 
@@ -64,7 +64,7 @@ func createApplication(kclient client.Client) error {
 					"recurse": true,
 					"exclude": "{**/*/catalog-info.yaml,**/*/tests/**}",
 				},
-				"repoURL":        config.ArgoCDRepoURL,
+				"repoURL":        cfg.ArgoCDRepoURL,
 				"targetRevision": "main",
 				"path":           "tasks",
 			},
@@ -85,14 +85,14 @@ func createApplication(kclient client.Client) error {
 		Version: "v1alpha1",
 	})
 
-	if err := kclient.Create(context.TODO(), application); err != nil {
+	if err := kclient.Create(ctx, application); err != nil {
 		argoCDLog.Error(err, err.Error())
 		return err
 	}
 	return nil
 }
 
-func waitForTasks(kclient client.Client) error {
+func waitForTasks(ctx context.Context, kclient client.Client, cfg config.OperatorConfig) error {
 	timeout := time.After(600 * time.Second)
 
 	// Check health every 10 seconds
@@ -105,6 +105,9 @@ func waitForTasks(kclient client.Client) error {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
 		case <-timeout:
 			return errors.New("tasks creation took too long to install")
 
@@ -117,11 +120,11 @@ func waitForTasks(kclient client.Client) error {
 				Kind:    "Application",
 				Version: "v1alpha1", // was incorrectly v1beta1
 			})
-			if err := kclient.Delete(context.Background(), u); err != nil {
+			if err := kclient.Delete(ctx, u); err != nil {
 				argoCDLog.Error(err, err.Error())
 			}
 			argoCDLog.Info("Deleted application, reinstalling...")
-			if err := createApplication(kclient); err != nil {
+			if err := createApplication(ctx, kclient, cfg); err != nil {
 				argoCDLog.Error(err, "Failed to recreate application")
 			}
 
@@ -129,7 +132,7 @@ func waitForTasks(kclient client.Client) error {
 			u := &unstructured.Unstructured{}
 			u.SetAPIVersion("argoproj.io/v1alpha1")
 			u.SetKind("Application")
-			err := kclient.Get(context.Background(), client.ObjectKey{
+			err := kclient.Get(ctx, client.ObjectKey{
 				Namespace: config.ArgoCDNamespace,
 				Name:      config.ArgoCDApplicationName,
 			}, u)

@@ -49,7 +49,11 @@ import (
 	techzonev1alpha1 "github.ibm.com/itz-content/itz-deployer-operator/api/v1alpha1"
 	"github.ibm.com/itz-content/itz-deployer-operator/internal/controller"
 	utils "github.ibm.com/itz-content/itz-deployer-operator/pkg"
-	"github.ibm.com/itz-content/itz-deployer-operator/pkg/argocd"
+
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/config"
+	"github.ibm.com/itz-content/itz-deployer-operator/pkg/tasks"
+
+	// "github.ibm.com/itz-content/itz-deployer-operator/pkg/argocd"
 
 	_ "github.ibm.com/itz-content/itz-deployer-operator/pkg/metrics" // register Prometheus metrics
 	"github.ibm.com/itz-content/itz-deployer-operator/pkg/rbac"
@@ -77,6 +81,8 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	ctx := ctrl.SetupSignalHandler()
+
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -248,11 +254,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := rbac.Run(preClient); err != nil {
+	if err := rbac.Run(ctx, preClient); err != nil {
 		setupLog.Error(err, "rbac setup failed")
 		os.Exit(1)
 	}
-	argocd.Run(preClient)
+	// argocd.Run(ctx, preClient)
+
+	cfg, err := config.LoadFromConfigMap(ctx, preClient)
+	if err != nil {
+		setupLog.Error(err, "failed to load operator config")
+		os.Exit(1)
+	}
+
+	if err := tasks.Sync(ctx, preClient, cfg); err != nil {
+		setupLog.Error(err, "tekton tasks sync failed")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -264,7 +281,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

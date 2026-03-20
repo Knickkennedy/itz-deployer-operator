@@ -69,7 +69,6 @@ type DeploymentReconciler struct {
 // +kubebuilder:rbac:groups=tekton.dev,resources=taskruns,verbs=get;list;watch
 
 const (
-	gitBaseOrgURL         = "https://github.ibm.com/itz-content"
 	pipelineFileName      = "pipeline.yaml"
 	pipelineRunFileName   = "pipelinerun.yaml"
 	postDeploymentMessage = "Post-deployment CRD created."
@@ -197,7 +196,7 @@ func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, dep
 		return ctrl.Result{}, err
 	}
 
-	gitRepoURL := fmt.Sprintf("%s/%s.git", strings.TrimSuffix(gitBaseOrgURL, "/"), deployment.Spec.RepoName)
+	gitRepoURL := fmt.Sprintf("%s/%s.git", strings.TrimSuffix(cfg.GitBaseURL, "/"), deployment.Spec.RepoName)
 	repoDir, cleanup, err := r.Cloner.Clone(ctx, gitRepoURL, deployment.Spec.Release, pat)
 	if err != nil {
 		logger.Error(err, "Failed to clone repository")
@@ -214,7 +213,7 @@ func (r *DeploymentReconciler) reconcileDeploymentPhase(ctx context.Context, dep
 	defer cleanup()
 
 	if deployment.Spec.Ansible.AnsiblePlaybook != "" {
-		job, err := r.reconcileJobResources(ctx, deployment, gitRepoURL)
+		job, err := r.reconcileJobResources(ctx, deployment, gitRepoURL, cfg.AnsibleRunnerImage, cfg.GitBaseURL)
 		if err != nil {
 			logger.Error(err, "Failed to reconcile Ansible job resources")
 			return ctrl.Result{}, err
@@ -278,7 +277,7 @@ func (r *DeploymentReconciler) applyFailedStatus(
 // Ansible / Job
 // ============================================================================
 
-func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deployment *techzonev1alpha1.Deployment, gitRepoURL string) (*batchv1.Job, error) {
+func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deployment *techzonev1alpha1.Deployment, gitRepoURL, ansibleRunnerImage, gitBaseURL string) (*batchv1.Job, error) {
 	logger := logf.FromContext(ctx)
 	jobName := fmt.Sprintf("%s-ansible-runner", deployment.Name)
 
@@ -290,7 +289,7 @@ func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deploy
 
 	if errors.IsNotFound(err) {
 		logger.Info("Creating new Ansible Job", "Job.Name", jobName)
-		job, err := r.newAnsibleJob(deployment, jobName, gitRepoURL)
+		job, err := r.newAnsibleJob(deployment, jobName, gitRepoURL, ansibleRunnerImage, gitBaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build Ansible job spec: %w", err)
 		}
@@ -323,7 +322,7 @@ func (r *DeploymentReconciler) reconcileJobResources(ctx context.Context, deploy
 }
 
 // newAnsibleJob constructs the Job spec using the two-container pattern (git-cloner + ansible-runner).
-func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deployment, jobName, gitRepoURL string) (*batchv1.Job, error) {
+func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deployment, jobName, gitRepoURL, ansibleRunnerImage, gitBaseURL string) (*batchv1.Job, error) {
 	const volumeName = "ansible-repo"
 	const mountPath = "/workspace"
 
@@ -363,12 +362,13 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 		playbookArgs = append(playbookArgs, "-e", "@"+mountPath+"/"+deployment.Spec.Parameters)
 	}
 
+	host := strings.SplitN(strings.TrimPrefix(gitBaseURL, "https://"), "/", 2)[0]
 	var shellCmd string
 	if deployment.Spec.Ansible.Requirements != "" {
 		reqPath := mountPath + "/" + deployment.Spec.Ansible.Requirements
 		shellCmd = fmt.Sprintf(
-			`git config --global url."https://${GIT_PAT}@github.ibm.com".insteadOf "https://github.ibm.com" && ansible-galaxy install -r %s && `,
-			reqPath,
+			`git config --global url."https://${GIT_PAT}@%s".insteadOf "https://%s" && ansible-galaxy install -r %s && `,
+			host, host, reqPath,
 		)
 	}
 	shellCmd += "ansible-playbook " + strings.Join(playbookArgs, " ")
@@ -378,7 +378,7 @@ func (r *DeploymentReconciler) newAnsibleJob(deployment *techzonev1alpha1.Deploy
 
 	mainContainer := corev1.Container{
 		Name:            "ansible-runner",
-		Image:           "docker.io/knickkennedy/k8s-tools:v1.0",
+		Image:           ansibleRunnerImage,
 		Command:         []string{"/bin/sh"},
 		Args:            []string{"-c", shellCmd},
 		Env:             []corev1.EnvVar{patEnvVar},
@@ -705,7 +705,7 @@ func (r *DeploymentReconciler) ReconcileConsoleNotification(ctx context.Context,
 // buildNotification constructs the desired ConsoleNotification for the current deployment phase.
 func (r *DeploymentReconciler) buildNotification(name, externalURL string, deployment *techzonev1alpha1.Deployment) *console.ConsoleNotification {
 	podLink := &console.Link{
-		Href: externalURL + "/k8s/ns/default/core~v1~Pod",
+		Href: externalURL + "/k8s/ns/" + deployment.Namespace + "/core~v1~Pod",
 		Text: "See more information in the pods here.",
 	}
 

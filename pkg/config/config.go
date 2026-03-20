@@ -16,7 +16,6 @@ const (
 	ArgoCDNamespace       = "openshift-gitops"
 	ArgoCDInstanceName    = "openshift-gitops"
 	ArgoCDApplicationName = "deployer-tekton-tasks"
-	ArgoCDRepoURL         = "https://github.ibm.com/itz-content/deployer-tekton-tasks.git"
 	ArgoCDSecretName      = "ibm-connection-auth"
 
 	// Pipeline / RBAC
@@ -31,6 +30,9 @@ const (
 type OperatorConfig struct {
 	SecretsManagerURL      string
 	SecretsManagerSecretID string
+	GitBaseURL             string
+	ArgoCDRepoURL          string
+	AnsibleRunnerImage     string
 }
 
 func LoadFromConfigMap(ctx context.Context, c client.Client) (OperatorConfig, error) {
@@ -47,10 +49,27 @@ func LoadFromConfigMap(ctx context.Context, c client.Client) (OperatorConfig, er
 	if err != nil {
 		return OperatorConfig{}, fmt.Errorf("failed to get operator configmap: %w", err)
 	}
-	return OperatorConfig{
+	cfg := OperatorConfig{
 		SecretsManagerURL:      cm.Data["secretsManagerURL"],
 		SecretsManagerSecretID: cm.Data["secretsManagerSecretID"],
-	}, nil
+		GitBaseURL:             cm.Data["gitBaseURL"],
+		ArgoCDRepoURL:          cm.Data["argoCDRepoURL"],
+		AnsibleRunnerImage:     cm.Data["ansibleRunnerImage"],
+	}
+
+	required := map[string]string{
+		"secretsManagerURL":      cfg.SecretsManagerURL,
+		"secretsManagerSecretID": cfg.SecretsManagerSecretID,
+		"gitBaseURL":             cfg.GitBaseURL,
+		"argoCDRepoURL":          cfg.ArgoCDRepoURL,
+		"ansibleRunnerImage":     cfg.AnsibleRunnerImage,
+	}
+	for key, val := range required {
+		if val == "" {
+			return OperatorConfig{}, fmt.Errorf("operator configmap is missing required key %q", key)
+		}
+	}
+	return cfg, nil
 }
 
 func getOperatorNamespace() (string, error) {

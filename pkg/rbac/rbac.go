@@ -66,8 +66,7 @@ func getGitHubPAT(ctx context.Context, cfg config.OperatorConfig) (string, error
 	return pat, nil
 }
 
-func CreateArgoCDRBAC(c client.Client) error {
-	ctx := context.TODO()
+func CreateArgoCDRBAC(ctx context.Context, c client.Client) error {
 
 	cfg, err := config.LoadFromConfigMap(ctx, c)
 	if err != nil {
@@ -81,7 +80,7 @@ func CreateArgoCDRBAC(c client.Client) error {
 
 	_, err = retry(ctx, func() (*corev1.Secret, error) {
 		rbacLog.Info(fmt.Sprintf("Attempting to create secret: %s.", config.ArgoCDSecretName))
-		return createArgoCDSecret(ctx, c, config.ArgoCDNamespace, config.ArgoCDSecretName, config.ArgoCDRepoURL, config.GitHubUsername, githubPAT)
+		return createArgoCDSecret(ctx, c, config.ArgoCDNamespace, config.ArgoCDSecretName, cfg.ArgoCDRepoURL, config.GitHubUsername, githubPAT)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create ArgoCD GitHub secret: %w", err)
@@ -118,19 +117,19 @@ func createArgoCDSecret(ctx context.Context, c client.Client, namespace, secretN
 	return secret, nil
 }
 
-func Run(c client.Client) error {
-	if err := createPipelineRBAC(c); err != nil {
+func Run(ctx context.Context, c client.Client) error {
+	if err := createPipelineRBAC(ctx, c); err != nil {
 		rbacLog.Error(err, "Failed to create pipeline RBAC")
 		return err
 	}
 	rbacLog.Info("RBAC role created successfully.")
 
-	cfg, err := config.LoadFromConfigMap(context.TODO(), c)
+	cfg, err := config.LoadFromConfigMap(ctx, c)
 	if err != nil {
 		return err
 	}
 
-	if err := createPipelineSecretAndMount(context.TODO(), c, cfg); err != nil {
+	if err := createPipelineSecretAndMount(ctx, c, cfg); err != nil {
 		rbacLog.Error(err, "Failed to create required GitHub secret")
 		return err
 	}
@@ -138,7 +137,7 @@ func Run(c client.Client) error {
 	return nil
 }
 
-func createPipelineRBAC(kclient client.Client) error {
+func createPipelineRBAC(ctx context.Context, kclient client.Client) error {
 	crb := &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "ClusterRoleBinding",
@@ -161,15 +160,15 @@ func createPipelineRBAC(kclient client.Client) error {
 	}
 
 	existingCRB := &rbacv1.ClusterRoleBinding{}
-	err := kclient.Get(context.TODO(), client.ObjectKey{Name: crb.Name}, existingCRB)
+	err := kclient.Get(ctx, client.ObjectKey{Name: crb.Name}, existingCRB)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return kclient.Create(context.TODO(), crb)
+			return kclient.Create(ctx, crb)
 		}
 		return err
 	}
 
-	return kclient.Update(context.TODO(), crb)
+	return kclient.Update(ctx, crb)
 }
 
 // createGitHubSecret creates a Kubernetes Secret to store the GitHub PAT.

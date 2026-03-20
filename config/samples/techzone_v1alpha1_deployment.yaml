@@ -1,9 +1,36 @@
+# Example 1: Tekton pipeline path (default)
+# The operator clones the repo at the given release tag, reads pipeline.yaml
+# and pipelinerun.yaml from the repo root, and creates a Tekton PipelineRun.
 apiVersion: techzone.techzone.ibm.com/v1alpha1
 kind: Deployment
 metadata:
   labels:
     app.kubernetes.io/name: itz-deployer-operator
     app.kubernetes.io/managed-by: kustomize
-  name: deployment-sample
+  name: deployer-cp4d-tekton
 spec:
-  # TODO(user): Add fields here
+  # Required: repository name under the configured gitBaseURL org.
+  repoName: deployer-cp4d
+  # Required: git tag or branch to deploy.
+  release: base-5.3.0
+  # Optional: path (relative to repo root) to a YAML file containing
+  # parameter overrides for the PipelineRun.
+  parameters: base-cpd.yaml
+---
+# Example 2: Ansible path
+# When spec.ansible.ansiblePlaybook is set, the operator creates a Kubernetes
+# Job with two containers: a git-cloner init container and an ansible-runner
+# main container (image configured via ansibleRunnerImage in the operator ConfigMap).
+apiVersion: techzone.techzone.ibm.com/v1alpha1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: itz-deployer-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: deployer-cp4d-ansible
+spec:
+  repoName: deployer-cp4d
+  release: base-5.3.0-ansible
+  ansible:
+    # Required for Ansible path: path to the playbook relative to repo root.
+    ansiblePlaybook: site.yml
